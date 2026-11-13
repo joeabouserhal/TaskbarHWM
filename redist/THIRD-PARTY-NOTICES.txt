@@ -1,0 +1,35 @@
+TaskbarHWM - third-party components
+===================================
+
+TaskbarHWM talks to the PawnIO kernel driver to read CPU temperature and power.
+PawnIO is by namazso (https://pawnio.eu).
+
+Files distributed with TaskbarHWM
+---------------------------------
+
+PawnIOLib.dll  (version 2.2.0, unmodified, digitally signed by namazso)
+    The user-mode helper library for the PawnIO driver.
+    License: GNU Lesser General Public License v2.1 or later (see COPYING.LGPL-2.1.txt).
+    Source:  https://github.com/namazso/PawnIO  (directory PawnIOLib)
+    TaskbarHWM loads this DLL dynamically; you may replace it with another build of PawnIOLib
+    by dropping it next to TaskbarHWM.exe.
+
+AMDFamily17 and IntelMSR modules  (release 0.2.11, unmodified, signed; embedded in TaskbarHWM.exe)
+    Small PawnIO modules that read CPU sensors.
+    License: GNU Lesser General Public License v2.1 or later (see COPYING.LGPL-2.1.txt).
+    Source:  https://github.com/namazso/PawnIO.Modules
+
+Not distributed, installed separately
+-------------------------------------
+
+PawnIO driver (PawnIO_setup.exe 2.2.0)
+    Installed by the TaskbarHWM setup wizard (or from the app's Settings) only when it is not
+    already present. It is downloaded from the official release page
+    https://github.com/namazso/PawnIO.Setup/releases/tag/2.2.0 and checked against a pinned
+    SHA-256 before it is run. The driver is licensed under GPL-2.0-or-later with an exception for
+    programs that communicate with it through its device interface. Uninstalling TaskbarHWM does
+    not remove PawnIO, because other programs may use it.
+
+NVIDIA NVML (nvml.dll)
+    Loaded from the NVIDIA display driver already installed on your PC. Not distributed with
+    TaskbarHWM.
