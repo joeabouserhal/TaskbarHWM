@@ -9,6 +9,30 @@ use windows_numerics::Vector2;
 
 use crate::metrics::Section;
 
+/// Which way a single-arrow icon points (the split network rows).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Arrow {
+    Up,
+    Down,
+}
+
+/// Draws a lone up or down arrow in the `size` x `size` square at (x, y), in the same style as the section icons.
+pub fn draw_arrow(rt: &ID2D1RenderTarget, brush: &ID2D1SolidColorBrush, arrow: Arrow, x: f32, y: f32, size: f32) {
+    let k = size / 24.0;
+    let sw = (k * 2.0).clamp(1.1, 2.4);
+    let pt = |u: f32, v: f32| Vector2 { X: x + u * k, Y: y + v * k };
+    // Shaft down the middle with a chevron head; the vertical extent 5..19 is centered on 12 like the other icons.
+    let (tail, tip, head_y) = match arrow {
+        Arrow::Up => (19.0, 5.0, 9.5),
+        Arrow::Down => (5.0, 19.0, 14.5),
+    };
+    unsafe {
+        rt.DrawLine(pt(12.0, tail), pt(12.0, tip), brush, sw, None);
+        rt.DrawLine(pt(7.0, head_y), pt(12.0, tip), brush, sw, None);
+        rt.DrawLine(pt(12.0, tip), pt(17.0, head_y), brush, sw, None);
+    }
+}
+
 /// Draws `section`'s icon in the `size` x `size` square whose top-left corner is (x, y), using the brush's color.
 pub fn draw(rt: &ID2D1RenderTarget, brush: &ID2D1SolidColorBrush, section: Section, x: f32, y: f32, size: f32) {
     let k = size / 24.0;
@@ -50,6 +74,16 @@ pub fn draw(rt: &ID2D1RenderTarget, brush: &ID2D1SolidColorBrush, section: Secti
                 rounded(2.5, 7.0, 21.5, 17.0, 2.5);
                 line((6.0, 13.5), (13.5, 13.5));
                 circle(18.0, 13.5, 1.1);
+            }
+            // Network traffic: an arrow up beside an arrow down.
+            Section::Net => {
+                // Vertical extent 5..19, centered on 12.
+                line((8.0, 19.0), (8.0, 5.0));
+                line((4.5, 8.5), (8.0, 5.0));
+                line((8.0, 5.0), (11.5, 8.5));
+                line((16.0, 5.0), (16.0, 19.0));
+                line((12.5, 15.5), (16.0, 19.0));
+                line((16.0, 19.0), (19.5, 15.5));
             }
             // Memory module: board, three chips, gold contacts.
             Section::Ram => {

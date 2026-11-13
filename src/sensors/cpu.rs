@@ -35,6 +35,11 @@ impl CpuSampler {
         Some(CpuSampler { q, utility, perf, base_mhz, pawn, pawn_status, retry: 0 })
     }
 
+    /// Power of Intel integrated graphics, read through the same PawnIO connection (None elsewhere).
+    pub fn igpu_power(&mut self) -> Option<f32> {
+        self.pawn.as_mut()?.igpu_power_w()
+    }
+
     pub fn sample(&mut self) -> CpuStats {
         let mut s = CpuStats::default();
         if !self.q.collect() {

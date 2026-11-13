@@ -47,8 +47,13 @@ fn dump(path: Option<&str>) {
         if let Some(r) = snap.ram {
             writeln!(out, "RAM  {:.1} / {:.1} GiB ({}%)", gib(r.used_bytes), gib(r.total_bytes), r.percent).ok();
         }
+        let (down, up) = snap.net.total(&[]);
+        writeln!(out, "NET  down {down:.0} B/s  up {up:.0} B/s").ok();
+        for a in &snap.net.adapters {
+            writeln!(out, "     {} [{}] down {:.0} B/s  up {:.0} B/s", a.name, if a.connected { "connected" } else { "not connected" }, a.down_bps, a.up_bps).ok();
+        }
         for g in &snap.gpus {
-            writeln!(out, "GPU  {} [{:?}] {}", g.name, g.vendor, g.luid).ok();
+            writeln!(out, "GPU  {} [{:?}{}] key='{}'", g.name, g.vendor, if g.integrated { ", integrated" } else { ", discrete" }, g.key).ok();
             writeln!(
                 out,
                 "     usage {}  temp {}  power {}  core {}  mem {}",

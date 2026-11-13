@@ -32,7 +32,7 @@ use crate::shell::setup::{self, SetupState};
 
 // Layout, in DIPs.
 const WIDTH: f32 = 340.0;
-const SETTINGS_WIDTH: f32 = 580.0;
+const SETTINGS_WIDTH: f32 = 864.0;
 const PAD: f32 = 12.0;
 const CARD_PAD: f32 = 14.0;
 const HEADER_H: f32 = 40.0;
@@ -125,6 +125,14 @@ enum Action {
     DiskStyle(&'static str),
     /// "combined" (one Disks section) or "split" (a section per disk).
     DiskLayout(&'static str),
+    /// Show network speeds as "bytes" or "bits" per second.
+    NetUnit(&'static str),
+    /// Network on the taskbar: "combined" (one row) or "split" (download and upload as separate rows).
+    NetLayout(&'static str),
+    /// Toggle network adapter `index` (into the live adapter list) in or out of the speed totals.
+    NetAdapter(usize),
+    /// Toggle graphics card `index` (into the live GPU list) for the flyout or the taskbar.
+    GpuToggle(usize, Target),
     /// Widget column spacing +/- 1.
     GapStep(i32),
     Autostart(bool),
@@ -141,6 +149,8 @@ struct Fmts {
     card_title: IDWriteTextFormat,
     label: IDWriteTextFormat,
     value: IDWriteTextFormat,
+    /// The unit after a value ("GHz", "%"): smaller than the value, same right edge.
+    unit: IDWriteTextFormat,
     subtitle: IDWriteTextFormat,
     small: IDWriteTextFormat,
     seg: IDWriteTextFormat,
@@ -209,6 +219,16 @@ pub fn toggle(p: OpenParams) {
     }
 }
 
+/// Opens the flyout on its settings page, switching an already open flyout over to it.
+pub fn show_settings(mut p: OpenParams) {
+    close(false);
+    p.settings = true;
+    if let Err(e) = open(p) {
+        eprintln!("flyout failed to open: {e}");
+        close(false);
+    }
+}
+
 pub fn update(snap: &Snapshot) {
     with_fly(|f| {
         f.snap = snap.clone();
@@ -258,6 +278,7 @@ fn make_fmts(dw: &IDWriteFactory) -> Result<Fmts> {
         card_title: make_fmt(dw, text, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
         label: make_fmt(dw, text, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
         value: make_fmt(dw, text, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+        unit: make_fmt(dw, text, 10.5, DWRITE_FONT_WEIGHT_NORMAL)?,
         subtitle: make_fmt(dw, text, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
         small: make_fmt(dw, text, 11.0, DWRITE_FONT_WEIGHT_NORMAL)?,
         seg: make_fmt(dw, text, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
@@ -269,6 +290,7 @@ fn make_fmts(dw: &IDWriteFactory) -> Result<Fmts> {
     };
     unsafe {
         fm.value.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+        fm.unit.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
         fm.subtitle.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
         fm.subtitle.SetTrimming(
             &DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 },
@@ -381,6 +403,8 @@ struct Painter<'a> {
     body_bottom: f32,
     width: f32,
     in_body: bool,
+    /// Extra height added to every settings row, so a column of cards can be stretched to end flush with its neighbours.
+    row_extra: f32,
     hits: Vec<Hit>,
     dw: &'a IDWriteFactory,
     drag: Option<Drag>,
@@ -388,9 +412,14 @@ struct Painter<'a> {
 }
 
 impl<'a> Painter<'a> {
+    /// Height of one settings row.
+    fn rh(&self) -> f32 {
+        SET_ROW_H + self.row_extra
+    }
+
     fn new(dc: Option<&'a ID2D1DeviceContext>, t: Theme, fm: &'a Fmts, dw: &'a IDWriteFactory, drag: Option<Drag>, mouse: Option<(f32, f32)>, scroll: f32, body_bottom: f32, width: f32) -> Self {
         let brush = dc.and_then(|d| unsafe { d.CreateSolidColorBrush(&t.text, None).ok() });
-        Painter { dc, brush, t, fm, mouse, scroll, body_bottom, width, in_body: false, hits: Vec::new(), dw, drag, drag_target: None }
+        Painter { dc, brush, t, fm, mouse, scroll, body_bottom, width, in_body: false, row_extra: 0.0, hits: Vec::new(), dw, drag, drag_target: None }
     }
 
     /// Content coordinates -> window coordinates.
@@ -476,6 +505,38 @@ impl<'a> Painter<'a> {
             let wide: Vec<u16> = s.encode_utf16().collect();
             unsafe { dc.DrawText(&wide, f, &r, b, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL) };
         }
+    }
+
+    /// Width and baseline (from the top of a `h`-tall box, text centered in it) of `s` drawn with `f`.
+    fn measure_text(&self, s: &str, f: &IDWriteTextFormat, h: f32) -> (f32, f32) {
+        let wide: Vec<u16> = s.encode_utf16().collect();
+        unsafe {
+            let Ok(l) = self.dw.CreateTextLayout(&wide, f, 2000.0, h) else { return (0.0, 0.0) };
+            let mut m = DWRITE_TEXT_METRICS::default();
+            let _ = l.GetMetrics(&mut m);
+            let mut lm = [DWRITE_LINE_METRICS::default(); 1];
+            let mut n = 0u32;
+            let base = if l.GetLineMetrics(Some(&mut lm), &mut n).is_ok() && n > 0 { (h - lm[0].height) / 2.0 + lm[0].baseline } else { 0.0 };
+            (m.widthIncludingTrailingWhitespace, base)
+        }
+    }
+
+    /// A value right-aligned in `r`, with its unit ("GHz", "%", "GB") smaller and muted, on the number's baseline.
+    fn value(&self, s: &str, r: D2D_RECT_F) {
+        let fm = self.fm;
+        let (num, unit) = metrics::split_unit(s);
+        let Some((unit, spaced)) = unit else {
+            self.text(s, &fm.value, r, self.t.text);
+            return;
+        };
+        let h = r.bottom - r.top;
+        let (unit_w, _) = self.measure_text(unit, &fm.unit, h);
+        let dy = self.measure_text("0", &fm.value, h).1 - self.measure_text("0", &fm.unit, h).1;
+        let gap = if spaced { 2.5 } else { 0.5 };
+        self.text(num, &fm.value, D2D_RECT_F { right: r.right - unit_w - gap, ..r }, self.t.text);
+        let (a, b) = (self.t.text, self.t.text_secondary);
+        let muted = D2D1_COLOR_F { r: a.r + (b.r - a.r) * 0.7, g: a.g + (b.g - a.g) * 0.7, b: a.b + (b.b - a.b) * 0.7, a: a.a + (b.a - a.a) * 0.7 };
+        self.text(unit, &fm.unit, D2D_RECT_F { top: r.top + dy, bottom: r.bottom + dy, ..r }, muted);
     }
 
     fn hit(&mut self, r: D2D_RECT_F, a: Action) {
@@ -705,7 +766,7 @@ fn dashboard_body(p: &mut Painter, cards: &[Card]) -> f32 {
         let mut ry = ty + CARD_TITLE_H + 2.0;
         for r in &c.rows {
             p.text(&r.label, &fm.row_label, rect(x0, ry, x1 - 92.0, ry + ROW_H), p.t.text_secondary);
-            p.text(&r.value, &fm.value, rect(x0 + 100.0, ry, x1, ry + ROW_H), p.t.text);
+            p.value(&r.value, rect(x0 + 100.0, ry, x1, ry + ROW_H));
             ry += ROW_H;
             if let Some(f) = r.frac {
                 p.fill(rect(x0, ry, x1, ry + 4.0), 2.0, p.t.track);
@@ -739,9 +800,16 @@ fn dashboard_body(p: &mut Painter, cards: &[Card]) -> f32 {
 
 /// A card of per-metric toggles for one hardware section. Returns the card height.
 fn metrics_card(p: &mut Painter, x: f32, y: f32, w: f32, title: &str, section: Section, cfg: &Config) -> f32 {
+    metrics_card_with(p, x, y, w, title, section, cfg, 0).0
+}
+
+/// [`metrics_card`] with room for `extra_rows` more settings rows under the toggles. Returns the card height and
+/// the y where those extra rows start.
+fn metrics_card_with(p: &mut Painter, x: f32, y: f32, w: f32, title: &str, section: Section, cfg: &Config, extra_rows: usize) -> (f32, f32) {
     let fm = p.fm;
+    let rh = p.rh();
     let defs: Vec<_> = METRICS.iter().filter(|m| m.section == section).collect();
-    let h = 10.0 + CARD_TITLE_H + 2.0 + defs.len() as f32 * SET_ROW_H + 10.0;
+    let h = 10.0 + CARD_TITLE_H + 2.0 + (defs.len() + extra_rows) as f32 * rh + 10.0;
     p.card(x, y, w, h);
     let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
     let pin_x = x1 - 40.0;
@@ -753,19 +821,65 @@ fn metrics_card(p: &mut Painter, x: f32, y: f32, w: f32, title: &str, section: S
     p.text("Taskbar", &fm.small, rect(pin_x - 14.0, ty, pin_x + 54.0, ty + CARD_TITLE_H), p.t.text_secondary);
     let mut ry = ty + CARD_TITLE_H + 2.0;
     for d in defs {
-        p.text(d.name, &fm.label, rect(x0, ry, x0 + 120.0, ry + SET_ROW_H), p.t.text);
-        let toggle_y = ry + (SET_ROW_H - 20.0) / 2.0;
+        p.text(d.name, &fm.label, rect(x0, ry, x0 + 120.0, ry + rh), p.t.text);
+        let toggle_y = ry + (rh - 20.0) / 2.0;
         p.toggle(fly_x, toggle_y, cfg.flyout.iter().any(|i| i == d.id), Action::Toggle(d.id, Target::Flyout));
         p.toggle(pin_x, toggle_y, cfg.pinned.iter().any(|i| i == d.id), Action::Toggle(d.id, Target::Pinned));
-        ry += SET_ROW_H;
+        ry += rh;
     }
+    (h, ry)
+}
+
+/// Network speeds: which to show, and whether they read in bytes or bits per second.
+fn network_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config) -> f32 {
+    let fm = p.fm;
+    let rh = p.rh();
+    let (h, mut ry) = metrics_card_with(p, x, y, w, "Network", Section::Net, cfg, 2);
+    let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
+    p.text("Speed unit", &fm.label, rect(x0, ry, x0 + 100.0, ry + rh), p.t.text);
+    let u = cfg.net_unit.as_str();
+    p.segmented(x1, ry + (rh - 28.0) / 2.0, 54.0, &[("MB/s", u == "bytes", Action::NetUnit("bytes")), ("Mbps", u == "bits", Action::NetUnit("bits"))]);
+    ry += rh;
+
+    p.text("Taskbar layout", &fm.label, rect(x0, ry, x0 + 110.0, ry + rh), p.t.text);
+    let lay = cfg.net_layout.as_str();
+    p.segmented(
+        x1,
+        ry + (rh - 28.0) / 2.0,
+        64.0,
+        &[("Combined", lay == "combined", Action::NetLayout("combined")), ("Split", lay == "split", Action::NetLayout("split"))],
+    );
+    h
+}
+
+/// Which network adapters make up the speeds. Only offered when there are several.
+fn adapters_card(p: &mut Painter, x: f32, y: f32, w: f32, view: &View) -> f32 {
+    let fm = p.fm;
+    let rh = p.rh();
+    let h = 10.0 + CARD_TITLE_H + 2.0 + view.adapters.len() as f32 * rh + 30.0 + 10.0;
+    p.card(x, y, w, h);
+    let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
+    let pin_x = x1 - 40.0;
+    let ty = y + 10.0;
+    p.icon(Section::Net, rect(x0, ty + 4.0, x0 + 16.0, ty + 20.0), p.t.text);
+    p.text("Network adapters", &fm.card_title, rect(x0 + 24.0, ty, x0 + 150.0, ty + CARD_TITLE_H), p.t.text);
+    p.text("Counted", &fm.small, rect(pin_x - 14.0, ty, pin_x + 54.0, ty + CARD_TITLE_H), p.t.text_secondary);
+    let mut ry = ty + CARD_TITLE_H + 2.0;
+    for (i, a) in view.adapters.iter().enumerate() {
+        let (label, tone) = if a.connected { (a.name.clone(), p.t.text) } else { (format!("{} (not connected)", a.name), p.t.text_secondary) };
+        p.text(&label, &fm.row_label, rect(x0, ry, pin_x - 10.0, ry + rh), tone);
+        p.toggle(pin_x, ry + (rh - 20.0) / 2.0, a.included, Action::NetAdapter(i));
+        ry += rh;
+    }
+    p.text("The speeds are the total of the adapters that are on.", &fm.note, rect(x0, ry + 2.0, x1, ry + 30.0), p.t.text_secondary);
     h
 }
 
 /// General options: units, update speed, autostart. Returns the card height.
 fn general_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config, view: &View) -> f32 {
     let fm = p.fm;
-    let rows = 3.0 * SET_ROW_H + if view.autostart_msg.is_some() { 30.0 } else { 0.0 };
+    let rh = p.rh();
+    let rows = 3.0 * rh + if view.autostart_msg.is_some() { 30.0 } else { 0.0 };
     let h = 10.0 + CARD_TITLE_H + 2.0 + rows + 10.0;
     p.card(x, y, w, h);
     let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
@@ -773,20 +887,20 @@ fn general_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config, view: &Vi
     p.text("General", &fm.card_title, rect(x0, ty, x0 + 120.0, ty + CARD_TITLE_H), p.t.text);
     let mut ry = ty + CARD_TITLE_H + 2.0;
 
-    p.text("Temperature unit", &fm.label, rect(x0, ry, x0 + 110.0, ry + SET_ROW_H), p.t.text);
+    p.text("Temperature unit", &fm.label, rect(x0, ry, x0 + 110.0, ry + rh), p.t.text);
     p.segmented(
         x1,
-        ry + 3.0,
+        ry + (rh - 28.0) / 2.0,
         44.0,
         &[("\u{00B0}C", !cfg.fahrenheit, Action::Fahrenheit(false)), ("\u{00B0}F", cfg.fahrenheit, Action::Fahrenheit(true))],
     );
-    ry += SET_ROW_H;
+    ry += rh;
 
-    p.text("Update speed", &fm.label, rect(x0, ry, x0 + 80.0, ry + SET_ROW_H), p.t.text);
+    p.text("Update speed", &fm.label, rect(x0, ry, x0 + 80.0, ry + rh), p.t.text);
     let cur = cfg.interval_ms;
     p.segmented(
         x1,
-        ry + 3.0,
+        ry + (rh - 28.0) / 2.0,
         38.0,
         &[
             ("0.5s", cur == 500, Action::Interval(500)),
@@ -795,11 +909,11 @@ fn general_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config, view: &Vi
             ("5s", cur == 5000, Action::Interval(5000)),
         ],
     );
-    ry += SET_ROW_H;
+    ry += rh;
 
-    p.text("Start with Windows", &fm.label, rect(x0, ry, x0 + 150.0, ry + SET_ROW_H), p.t.text);
-    p.toggle(x1 - 40.0, ry + (SET_ROW_H - 20.0) / 2.0, view.autostart, Action::Autostart(!view.autostart));
-    ry += SET_ROW_H;
+    p.text("Start with Windows", &fm.label, rect(x0, ry, x0 + 150.0, ry + rh), p.t.text);
+    p.toggle(x1 - 40.0, ry + (rh - 20.0) / 2.0, view.autostart, Action::Autostart(!view.autostart));
+    ry += rh;
     if let Some(m) = &view.autostart_msg {
         p.text(m, &fm.note, rect(x0, ry, x1, ry + 30.0), p.t.text_secondary);
     }
@@ -809,7 +923,8 @@ fn general_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config, view: &Vi
 /// How things look: taskbar text size, spacing between values, flyout transparency. Returns the card height.
 fn customization_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config) -> f32 {
     let fm = p.fm;
-    let h = 10.0 + CARD_TITLE_H + 2.0 + 5.0 * SET_ROW_H + 10.0;
+    let rh = p.rh();
+    let h = 10.0 + CARD_TITLE_H + 2.0 + 3.0 * rh + 10.0;
     p.card(x, y, w, h);
     let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
     let ty = y + 10.0;
@@ -817,11 +932,11 @@ fn customization_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config) -> 
     let mut ry = ty + CARD_TITLE_H + 2.0;
 
     // What identifies each row on the taskbar.
-    p.text("Labels", &fm.label, rect(x0, ry, x0 + 50.0, ry + SET_ROW_H), p.t.text);
+    p.text("Labels", &fm.label, rect(x0, ry, x0 + 50.0, ry + rh), p.t.text);
     let style = cfg.label_style.as_str();
     p.segmented(
         x1,
-        ry + 3.0,
+        ry + (rh - 28.0) / 2.0,
         66.0,
         &[
             ("Icon", style == "icon", Action::Labels("icon")),
@@ -829,51 +944,56 @@ fn customization_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config) -> 
             ("Icon + label", style == "both", Action::Labels("both")),
         ],
     );
-    ry += SET_ROW_H;
+    ry += rh;
 
-    p.text("Label badge", &fm.label, rect(x0, ry, x0 + 120.0, ry + SET_ROW_H), p.t.text);
-    p.toggle(x1 - 40.0, ry + (SET_ROW_H - 20.0) / 2.0, cfg.label_badge, Action::Badge(!cfg.label_badge));
-    ry += SET_ROW_H;
-
-    p.text("Text size", &fm.label, rect(x0, ry, x0 + 100.0, ry + SET_ROW_H), p.t.text);
-    let font = cfg.font_size;
-    p.stepper(
-        x1,
-        ry + 3.0,
-        &format!("{}", font as i32),
-        (font > 9.0).then_some(Action::FontStep(-1)),
-        (font < 15.0).then_some(Action::FontStep(1)),
-    );
-    ry += SET_ROW_H;
-
-    p.text("Spacing", &fm.label, rect(x0, ry, x0 + 100.0, ry + SET_ROW_H), p.t.text);
-    let gap = cfg.gap;
-    p.stepper(
-        x1,
-        ry + 3.0,
-        &format!("{}", gap as i32),
-        (gap > 2.0).then_some(Action::GapStep(-1)),
-        (gap < 24.0).then_some(Action::GapStep(1)),
-    );
-    ry += SET_ROW_H;
+    p.text("Label badge", &fm.label, rect(x0, ry, x0 + 120.0, ry + rh), p.t.text);
+    p.toggle(x1 - 40.0, ry + (rh - 20.0) / 2.0, cfg.label_badge, Action::Badge(!cfg.label_badge));
+    ry += rh;
 
     // Lower tint opacity = more see-through. Buckets so a hand-edited value still highlights the nearest one.
-    p.text("Transparency", &fm.label, rect(x0, ry, x0 + 80.0, ry + SET_ROW_H), p.t.text);
+    p.text("Transparency", &fm.label, rect(x0, ry, x0 + 80.0, ry + rh), p.t.text);
     let bucket = if cfg.tint <= 120 { 0 } else if cfg.tint <= 180 { 1 } else { 2 };
     p.segmented(
         x1,
-        ry + 3.0,
+        ry + (rh - 28.0) / 2.0,
         54.0,
         &[("Clear", bucket == 0, Action::Tint(96)), ("Normal", bucket == 1, Action::Tint(150)), ("Frosted", bucket == 2, Action::Tint(205))],
     );
     h
 }
 
+/// Which graphics cards appear in the flyout and on the taskbar. Only offered when there are several.
+fn gpus_card(p: &mut Painter, x: f32, y: f32, w: f32, view: &View) -> f32 {
+    let fm = p.fm;
+    let rh = p.rh();
+    let h = 10.0 + CARD_TITLE_H + 2.0 + view.gpus.len() as f32 * rh + 30.0 + 10.0;
+    p.card(x, y, w, h);
+    let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
+    let pin_x = x1 - 40.0;
+    let fly_x = pin_x - 24.0 - 40.0;
+    let ty = y + 10.0;
+    p.icon(Section::Gpu, rect(x0, ty + 4.0, x0 + 16.0, ty + 20.0), p.t.text);
+    p.text("Graphics cards", &p.fm.card_title, rect(x0 + 24.0, ty, x0 + 130.0, ty + CARD_TITLE_H), p.t.text);
+    p.text("Flyout", &fm.small, rect(fly_x - 14.0, ty, fly_x + 54.0, ty + CARD_TITLE_H), p.t.text_secondary);
+    p.text("Taskbar", &fm.small, rect(pin_x - 14.0, ty, pin_x + 54.0, ty + CARD_TITLE_H), p.t.text_secondary);
+    let mut ry = ty + CARD_TITLE_H + 2.0;
+    for (i, g) in view.gpus.iter().enumerate() {
+        p.text(&g.name, &fm.row_label, rect(x0, ry, fly_x - 10.0, ry + rh), p.t.text);
+        let toggle_y = ry + (rh - 20.0) / 2.0;
+        p.toggle(fly_x, toggle_y, !g.hidden_in_flyout, Action::GpuToggle(i, Target::Flyout));
+        p.toggle(pin_x, toggle_y, g.on_taskbar, Action::GpuToggle(i, Target::Pinned));
+        ry += rh;
+    }
+    p.text("With several cards on the taskbar they are labelled GPU1, GPU2 and so on.", &fm.note, rect(x0, ry + 2.0, x1, ry + 30.0), p.t.text_secondary);
+    h
+}
+
 /// Connected local disks: which to show in the flyout and on the taskbar, and how to show their space.
 fn disks_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config, view: &View) -> f32 {
     let fm = p.fm;
+    let rh = p.rh();
     let rows = view.disks.len().max(1) as f32 + 2.0; // a row per disk (or a hint) plus the "Layout" and "Show" rows
-    let h = 10.0 + CARD_TITLE_H + 2.0 + rows * SET_ROW_H + 10.0;
+    let h = 10.0 + CARD_TITLE_H + 2.0 + rows * rh + 10.0;
     p.card(x, y, w, h);
     let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
     let pin_x = x1 - 40.0;
@@ -885,31 +1005,31 @@ fn disks_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config, view: &View
     p.text("Taskbar", &fm.small, rect(pin_x - 14.0, ty, pin_x + 54.0, ty + CARD_TITLE_H), p.t.text_secondary);
     let mut ry = ty + CARD_TITLE_H + 2.0;
     if view.disks.is_empty() {
-        p.text("No local disks found", &fm.label, rect(x0, ry, x1, ry + SET_ROW_H), p.t.text_secondary);
-        ry += SET_ROW_H;
+        p.text("No local disks found", &fm.label, rect(x0, ry, x1, ry + rh), p.t.text_secondary);
+        ry += rh;
     }
     for (i, d) in view.disks.iter().enumerate() {
-        p.text(&metrics::disk_name(d), &fm.row_label, rect(x0, ry, fly_x - 10.0, ry + SET_ROW_H), p.t.text);
-        let toggle_y = ry + (SET_ROW_H - 20.0) / 2.0;
+        p.text(&metrics::disk_name(d), &fm.row_label, rect(x0, ry, fly_x - 10.0, ry + rh), p.t.text);
+        let toggle_y = ry + (rh - 20.0) / 2.0;
         p.toggle(fly_x, toggle_y, !cfg.disks_hidden.contains(&d.root), Action::DiskToggle(i, Target::Flyout));
         p.toggle(pin_x, toggle_y, cfg.disks_pinned.contains(&d.root), Action::DiskToggle(i, Target::Pinned));
-        ry += SET_ROW_H;
+        ry += rh;
     }
-    p.text("Layout", &fm.label, rect(x0, ry, x0 + 60.0, ry + SET_ROW_H), p.t.text);
+    p.text("Layout", &fm.label, rect(x0, ry, x0 + 60.0, ry + rh), p.t.text);
     let lay = cfg.disk_layout.as_str();
     p.segmented(
         x1,
-        ry + 3.0,
+        ry + (rh - 28.0) / 2.0,
         64.0,
         &[("Combined", lay == "combined", Action::DiskLayout("combined")), ("Split", lay == "split", Action::DiskLayout("split"))],
     );
-    ry += SET_ROW_H;
+    ry += rh;
 
-    p.text("Show", &fm.label, rect(x0, ry, x0 + 40.0, ry + SET_ROW_H), p.t.text);
+    p.text("Show", &fm.label, rect(x0, ry, x0 + 40.0, ry + rh), p.t.text);
     let st = cfg.disk_style.as_str();
     p.segmented(
         x1,
-        ry + 3.0,
+        ry + (rh - 28.0) / 2.0,
         64.0,
         &[
             ("Used/total", st == "used_total", Action::DiskStyle("used_total")),
@@ -966,7 +1086,9 @@ fn pawn_card(p: &mut Painter, x: f32, y: f32, w: f32, view: &View) -> f32 {
 /// Reorder the taskbar widget's rows and columns by dragging chips. Returns the card height.
 fn layout_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config) -> f32 {
     let fm = p.fm;
-    let h = 10.0 + CARD_TITLE_H + 2.0 + 2.0 * CHIP_ROW_H + 10.0;
+    let rh = p.rh();
+    let crh = CHIP_ROW_H + p.row_extra;
+    let h = 10.0 + CARD_TITLE_H + 2.0 + 2.0 * crh + rh + 10.0;
     p.card(x, y, w, h);
     let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
     let ty = y + 10.0;
@@ -975,45 +1097,149 @@ fn layout_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config) -> f32 {
 
     let chip_x = x0 + 66.0;
     let row_y = ty + CARD_TITLE_H + 2.0;
-    p.text("Rows", &fm.label, rect(x0, row_y, x0 + 60.0, row_y + CHIP_ROW_H), p.t.text);
+    p.text("Rows", &fm.label, rect(x0, row_y, x0 + 60.0, row_y + crh), p.t.text);
     let rows: Vec<(&'static str, &'static str, bool, Option<Section>)> = cfg
         .row_order
         .iter()
         .filter_map(|k| Section::from_key(k))
         .map(|s| (s.key(), s.label(), metrics::section_pinned(cfg, s), Some(s)))
         .collect();
-    p.chip_strip(chip_x, row_y + (CHIP_ROW_H - CHIP_H) / 2.0, ListKind::Rows, &rows);
+    p.chip_strip(chip_x, row_y + (crh - CHIP_H) / 2.0, ListKind::Rows, &rows);
 
-    let col_y = row_y + CHIP_ROW_H;
-    p.text("Columns", &fm.label, rect(x0, col_y, x0 + 60.0, col_y + CHIP_ROW_H), p.t.text);
+    let col_y = row_y + crh;
+    p.text("Columns", &fm.label, rect(x0, col_y, x0 + 60.0, col_y + crh), p.t.text);
     let cols: Vec<(&'static str, &'static str, bool, Option<Section>)> =
         metrics::visible_kinds(cfg).into_iter().map(|k| (k.key(), k.label(), true, None)).collect();
     if cols.is_empty() {
-        p.text("Turn on Taskbar for some metrics above to arrange them.", &fm.label, rect(chip_x, col_y, x1, col_y + CHIP_ROW_H), p.t.text_secondary);
+        p.text("Turn on Taskbar for some metrics above to arrange them.", &fm.label, rect(chip_x, col_y, x1, col_y + crh), p.t.text_secondary);
     } else {
-        p.chip_strip(chip_x, col_y + (CHIP_ROW_H - CHIP_H) / 2.0, ListKind::Cols, &cols);
+        p.chip_strip(chip_x, col_y + (crh - CHIP_H) / 2.0, ListKind::Cols, &cols);
     }
+
+    // Size of the text and the space between values: both shape how this layout looks on the taskbar.
+    let sy = col_y + crh;
+    let mid = (x0 + x1) / 2.0;
+    p.text("Text size", &fm.label, rect(x0, sy, x0 + 100.0, sy + rh), p.t.text);
+    let font = cfg.font_size;
+    p.stepper(
+        mid - 16.0,
+        sy + (rh - 28.0) / 2.0,
+        &format!("{}", font as i32),
+        (font > 9.0).then_some(Action::FontStep(-1)),
+        (font < 15.0).then_some(Action::FontStep(1)),
+    );
+    p.text("Spacing", &fm.label, rect(mid + 16.0, sy, mid + 116.0, sy + rh), p.t.text);
+    let gap = cfg.gap;
+    p.stepper(
+        x1,
+        sy + (rh - 28.0) / 2.0,
+        &format!("{}", gap as i32),
+        (gap > 2.0).then_some(Action::GapStep(-1)),
+        (gap < 24.0).then_some(Action::GapStep(1)),
+    );
     h
 }
 
-/// Settings page body: two columns so it doesn't become one tall list. Returns the content height.
+/// Draws the three settings columns with `extra[i]` more height per row in column `i`. Returns each column's height
+/// (including the gap below its last card).
+///
+/// 1. Processor side: CPU, the disks, and the driver the CPU's temperature and power depend on.
+/// 2. Graphics and memory.
+/// 3. Network and its adapters, then general options.
+fn settings_columns(p: &mut Painter, cfg: &Config, view: &View, col_w: f32, extra: [f32; 3]) -> [f32; 3] {
+    let xs = [PAD, 2.0 * PAD + col_w, 3.0 * PAD + 2.0 * col_w];
+    let (mut c1, mut c2, mut c3) = (0.0, 0.0, 0.0);
+
+    p.row_extra = extra[0];
+    c1 += metrics_card(p, xs[0], c1, col_w, "CPU", Section::Cpu, cfg) + CARD_GAP;
+    c1 += disks_card(p, xs[0], c1, col_w, cfg, view) + CARD_GAP;
+    c1 += pawn_card(p, xs[0], c1, col_w, view) + CARD_GAP;
+
+    p.row_extra = extra[1];
+    if view.gpus.len() >= 2 {
+        c2 += gpus_card(p, xs[1], c2, col_w, view) + CARD_GAP;
+    }
+    c2 += metrics_card(p, xs[1], c2, col_w, "GPU", Section::Gpu, cfg) + CARD_GAP;
+    c2 += metrics_card(p, xs[1], c2, col_w, "Memory", Section::Ram, cfg) + CARD_GAP;
+
+    p.row_extra = extra[2];
+    c3 += network_card(p, xs[2], c3, col_w, cfg) + CARD_GAP;
+    if view.adapters.len() >= 2 {
+        c3 += adapters_card(p, xs[2], c3, col_w, view) + CARD_GAP;
+    }
+    c3 += general_card(p, xs[2], c3, col_w, cfg, view) + CARD_GAP;
+    p.row_extra = 0.0;
+    [c1, c2, c3]
+}
+
+/// Settings page body: three columns so it stays short, with related cards kept together. Along the bottom: the
+/// widget's layout (two columns wide) and the look of its labels. Every column, and both bottom cards, end flush:
+/// the shorter ones get a little more height per row instead of leaving a gap. Returns the content height.
 fn settings_body(p: &mut Painter, cfg: &Config, view: &View) -> f32 {
-    let col_w = (p.width - 3.0 * PAD) / 2.0;
-    let (lx, rx) = (PAD, 2.0 * PAD + col_w);
-    let (mut ly, mut ry) = (0.0, 0.0);
-    ly += metrics_card(p, lx, ly, col_w, "CPU", Section::Cpu, cfg) + CARD_GAP;
-    ly += metrics_card(p, lx, ly, col_w, "Memory", Section::Ram, cfg) + CARD_GAP;
-    ly += general_card(p, lx, ly, col_w, cfg, view) + CARD_GAP;
-    ly += customization_card(p, lx, ly, col_w, cfg) + CARD_GAP;
-    ry += metrics_card(p, rx, ry, col_w, "GPU", Section::Gpu, cfg) + CARD_GAP;
-    ry += disks_card(p, rx, ry, col_w, cfg, view) + CARD_GAP;
-    ry += pawn_card(p, rx, ry, col_w, view) + CARD_GAP;
-    let top = ly.max(ry);
-    top + layout_card(p, PAD, top, p.width - 2.0 * PAD, cfg) + PAD
+    let col_w = (p.width - 4.0 * PAD) / 3.0;
+    let wide = 2.0 * col_w + PAD;
+    let xs = [PAD, 2.0 * PAD + col_w, 3.0 * PAD + 2.0 * col_w];
+
+    // Each column's height grows by one pixel per row for every pixel of row_extra, so two dry runs give its height
+    // and its row count.
+    let measure = |p: &Painter, extra: f32| {
+        let mut m = Painter::new(None, p.t, p.fm, p.dw, None, None, 0.0, f32::MAX, p.width);
+        m.in_body = true;
+        settings_columns(&mut m, cfg, view, col_w, [extra; 3])
+    };
+    let (h0, h1) = (measure(p, 0.0), measure(p, 1.0));
+    // All rows start a little taller than the base; the shorter columns are stretched up to the tallest.
+    let base = 2.0;
+    let target = (0..3).map(|i| h0[i] + (h1[i] - h0[i]) * base).fold(0.0, f32::max);
+    let mut extra = [0.0; 3];
+    for i in 0..3 {
+        let rows = (h1[i] - h0[i]).max(1.0);
+        extra[i] = (target - h0[i]) / rows;
+    }
+    let top = settings_columns(p, cfg, view, col_w, extra).into_iter().fold(0.0, f32::max);
+
+    // Bottom row: same idea for the two cards.
+    let bottom = |p: &mut Painter, e: [f32; 2], draw: bool| -> [f32; 2] {
+        let mut m;
+        let q: &mut Painter = if draw {
+            p
+        } else {
+            m = Painter::new(None, p.t, p.fm, p.dw, None, None, 0.0, f32::MAX, p.width);
+            m.in_body = true;
+            &mut m
+        };
+        q.row_extra = e[0];
+        let a = layout_card(q, xs[0], top, wide, cfg);
+        q.row_extra = e[1];
+        let b = customization_card(q, xs[2], top, col_w, cfg);
+        q.row_extra = 0.0;
+        [a, b]
+    };
+    let (b0, b1) = (bottom(p, [0.0; 2], false), bottom(p, [1.0; 2], false));
+    let btarget = b0[0].max(b0[1]);
+    let be = [0, 1].map(|i| (btarget - b0[i]) / (b1[i] - b0[i]).max(1.0));
+    let hb = bottom(p, be, true);
+    top + hb[0].max(hb[1]) + PAD
 }
 
 /// Things the settings page needs besides the config.
+/// A graphics card as the settings page needs it.
+struct GpuInfo {
+    name: String,
+    hidden_in_flyout: bool,
+    on_taskbar: bool,
+}
+
+/// A network adapter as the settings page needs it.
+struct AdapterInfo {
+    name: String,
+    connected: bool,
+    included: bool,
+}
+
 struct View {
+    gpus: Vec<GpuInfo>,
+    adapters: Vec<AdapterInfo>,
     disks: Vec<DiskStats>,
     autostart: bool,
     autostart_msg: Option<String>,
@@ -1024,7 +1250,25 @@ struct View {
 
 impl Fly {
     fn view(&self) -> View {
+        let cfg = config::get();
+        let on_taskbar: Vec<&str> = metrics::taskbar_gpus(&cfg, &self.snap).iter().map(|g| g.key.as_str()).collect();
+        let gpus = self
+            .snap
+            .gpus
+            .iter()
+            .map(|g| GpuInfo { name: g.name.clone(), hidden_in_flyout: cfg.gpus_hidden.contains(&g.key), on_taskbar: on_taskbar.contains(&g.key.as_str()) })
+            .collect();
+        let counted: Vec<&str> = self.snap.net.included(&cfg.net_adapters).map(|a| a.name.as_str()).collect();
+        let adapters = self
+            .snap
+            .net
+            .adapters
+            .iter()
+            .map(|a| AdapterInfo { name: a.name.clone(), connected: a.connected, included: counted.contains(&a.name.as_str()) })
+            .collect();
         let mut v = View {
+            gpus,
+            adapters,
             disks: self.snap.disks.clone(),
             autostart: self.autostart,
             autostart_msg: self.autostart_msg.clone(),
@@ -1183,6 +1427,49 @@ impl Fly {
             Action::Badge(b) => cfg.label_badge = b,
             Action::DiskStyle(st) => cfg.disk_style = st.to_string(),
             Action::DiskLayout(l) => cfg.disk_layout = l.to_string(),
+            Action::NetUnit(u) => cfg.net_unit = u.to_string(),
+            Action::NetLayout(l) => cfg.net_layout = l.to_string(),
+            Action::NetAdapter(i) => {
+                if let Some(name) = self.snap.net.adapters.get(i).map(|a| a.name.clone()) {
+                    // Start from what is counted now (no choice yet = every adapter), then flip this one.
+                    let mut sel: Vec<String> = self.snap.net.included(&cfg.net_adapters).map(|a| a.name.clone()).collect();
+                    match sel.iter().position(|n| *n == name) {
+                        // At least one adapter always counts.
+                        Some(pos) if sel.len() > 1 => {
+                            sel.remove(pos);
+                        }
+                        Some(_) => {}
+                        None => sel.push(name),
+                    }
+                    // Every adapter on again is "all", which also picks up adapters plugged in later.
+                    cfg.net_adapters = if sel.len() == self.snap.net.adapters.len() { Vec::new() } else { sel };
+                }
+            }
+            Action::GpuToggle(i, target) => {
+                if let Some(key) = self.snap.gpus.get(i).map(|g| g.key.clone()) {
+                    match target {
+                        Target::Flyout => match cfg.gpus_hidden.iter().position(|k| *k == key) {
+                            Some(pos) => {
+                                cfg.gpus_hidden.remove(pos);
+                            }
+                            None => cfg.gpus_hidden.push(key),
+                        },
+                        Target::Pinned => {
+                            // Start from what the taskbar effectively shows now (no choice yet = the first card).
+                            let mut sel: Vec<String> = metrics::taskbar_gpus(&cfg, &self.snap).iter().map(|g| g.key.clone()).collect();
+                            match sel.iter().position(|k| *k == key) {
+                                // The taskbar always shows at least one card.
+                                Some(pos) if sel.len() > 1 => {
+                                    sel.remove(pos);
+                                }
+                                Some(_) => {}
+                                None => sel.push(key),
+                            }
+                            cfg.gpus_pinned = sel;
+                        }
+                    }
+                }
+            }
             Action::DiskToggle(i, target) => {
                 if let Some(d) = self.snap.disks.get(i) {
                     let root = d.root.clone();

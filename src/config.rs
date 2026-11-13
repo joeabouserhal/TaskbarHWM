@@ -20,19 +20,29 @@ pub struct Config {
     pub label_badge: bool,
     /// Disks ("C:") hidden from the flyout. Everything connected is shown unless listed here.
     pub disks_hidden: Vec<String>,
+    /// GPUs (by `GpuStats::key`) hidden from the flyout. Every GPU is shown unless listed here.
+    pub gpus_hidden: Vec<String>,
+    /// GPUs shown on the taskbar. Empty means "the first (discrete) GPU".
+    pub gpus_pinned: Vec<String>,
     /// Disks pinned to the taskbar widget (each becomes a row).
     pub disks_pinned: Vec<String>,
     /// How disk space is shown: "used_total", "percent" or "free".
     pub disk_style: String,
     /// "combined": all disks in one Disks section; "split": every disk is its own section.
     pub disk_layout: String,
+    /// Network speeds as "bytes" (KB/s, MB/s) or "bits" (Kbps, Mbps).
+    pub net_unit: String,
+    /// "combined": one Net row with download and upload; "split": download and upload are rows of their own.
+    pub net_layout: String,
+    /// Network adapters (by name) whose traffic is counted. Empty means all of them, as a total.
+    pub net_adapters: Vec<String>,
     /// Set once the first-run welcome (settings page) has been shown.
     pub setup_shown: bool,
     /// Bumped when a release changes what saved settings mean, so one-time migrations run once.
     pub schema: u32,
     /// Metric ids pinned to the taskbar widget (kept in catalog order).
     pub pinned: Vec<String>,
-    /// Order of the taskbar widget's rows ("cpu", "gpu", "ram").
+    /// Order of the taskbar widget's rows ("cpu", "gpu", "ram", "disk", "net").
     pub row_order: Vec<String>,
     /// Order of the taskbar widget's columns (metric kinds, e.g. "usage", "temp").
     pub col_order: Vec<String>,
@@ -52,9 +62,14 @@ impl Default for Config {
             label_style: "both".to_string(),
             label_badge: true,
             disks_hidden: Vec::new(),
+            gpus_hidden: Vec::new(),
+            gpus_pinned: Vec::new(),
             disks_pinned: Vec::new(),
             disk_style: "used_total".to_string(),
             disk_layout: "combined".to_string(),
+            net_unit: "bytes".to_string(),
+            net_layout: "combined".to_string(),
+            net_adapters: Vec::new(),
             setup_shown: false,
             schema: 0,
             pinned: s(&["cpu.usage", "cpu.temp", "gpu.usage", "gpu.temp"]),
@@ -108,6 +123,12 @@ impl Config {
         if !matches!(self.disk_style.as_str(), "used_total" | "percent" | "free") {
             self.disk_style = "used_total".to_string();
         }
+        if !matches!(self.net_layout.as_str(), "combined" | "split") {
+            self.net_layout = "combined".to_string();
+        }
+        if !matches!(self.net_unit.as_str(), "bytes" | "bits") {
+            self.net_unit = "bytes".to_string();
+        }
         if !matches!(self.label_style.as_str(), "icon" | "text" | "both") {
             self.label_style = "both".to_string();
         }
@@ -118,10 +139,15 @@ impl Config {
     }
 
     pub fn load() -> Config {
-        let mut c: Config = path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default();
+        let mut c: Config = match path().and_then(|p| std::fs::read_to_string(&p).ok().map(|t| (p, t))) {
+            Some((p, text)) => toml::from_str(&text).unwrap_or_else(|_| {
+                // A file that doesn't parse (a typo in a hand edit) would otherwise be overwritten with the defaults
+                // the next time a setting changes. Keep it beside the original so nothing is lost.
+                let _ = std::fs::write(p.with_extension("toml.bad"), &text);
+                Config::default()
+            }),
+            None => Config::default(),
+        };
         c.normalize();
         if c.schema < 1 {
             // RAM's "In use" row used to show "x / y GB"; it is now "Usage" (percent) plus a separate "Used".

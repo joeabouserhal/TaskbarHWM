@@ -27,6 +27,8 @@ use crate::sensors::{Sampler, Snapshot};
 const WM_SNAPSHOT: u32 = WM_APP + 1;
 /// Posted by the flyout when the user changed a setting.
 pub const WM_CONFIG: u32 = WM_APP + 2;
+/// Posted by the right-click menu: open the flyout on its settings page.
+const WM_OPEN_SETTINGS: u32 = WM_APP + 4;
 const TIMER_TICK: usize = 1;
 const FONT: windows::core::PCWSTR = w!("Segoe UI Variable Text");
 
@@ -39,15 +41,27 @@ const CAP_HEIGHT: f32 = 0.70;
 const EDGE: f32 = 4.0; // margin from the taskbar's left edge
 const CORNER: f32 = 4.0;
 
-/// A value, measured so it can be right-aligned in its column.
+/// A value, measured so it can be right-aligned in its column: the number, and its unit drawn smaller and muted.
 struct Cell {
-    layout: IDWriteTextLayout,
+    num: IDWriteTextLayout,
+    unit: Option<UnitPart>,
+    /// Total width of number and unit.
     w: f32,
+}
+
+struct UnitPart {
+    layout: IDWriteTextLayout,
+    /// Where the unit starts, measured from the start of the number.
+    x: f32,
 }
 
 struct GRow {
     /// Section whose icon leads the row (None for the text-only hint row).
     icon: Option<metrics::Section>,
+    /// Draw this arrow instead of the section's icon.
+    arrow: Option<metrics::Arrow>,
+    /// Width the icon takes: a lone arrow only fills the middle of its square, so it gets a narrower slot.
+    icon_w: f32,
     label: Option<IDWriteTextLayout>,
     /// Width of the label area (icon and/or text).
     label_w: f32,
@@ -82,6 +96,10 @@ struct App {
     fmt_size: f32,
     /// Semibold, slightly smaller: row labels must not read like the values.
     label_fmt: IDWriteTextFormat,
+    /// Smaller still: the units ("GHz", "%", "GB") that follow a value.
+    unit_fmt: IDWriteTextFormat,
+    /// Moves a unit down so its baseline lands on the baseline of the (larger) number beside it.
+    unit_dy: f32,
     /// Vertical nudges (DIPs) that put the cap-height midline of values / labels on the row's midline.
     val_dy: f32,
     label_dy: f32,
@@ -108,6 +126,16 @@ fn measure(l: &IDWriteTextLayout) -> f32 {
 
 fn label_size(font: f32) -> f32 {
     (font * 0.9).round().max(8.0)
+}
+
+fn unit_size(font: f32) -> f32 {
+    // Not rounded: at the default size a whole-point step would be too coarse.
+    (font * 0.88).max(8.0)
+}
+
+/// `a` moved `k` of the way toward `b`.
+fn mix(a: D2D1_COLOR_F, b: D2D1_COLOR_F, k: f32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F { r: a.r + (b.r - a.r) * k, g: a.g + (b.g - a.g) * k, b: a.b + (b.b - a.b) * k, a: a.a + (b.a - a.a) * k }
 }
 
 fn make_format(dwrite: &IDWriteFactory, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
@@ -151,6 +179,38 @@ impl App {
         unsafe { self.gfx.dwrite.CreateTextLayout(&wide, &self.fmt, 2000.0, self.row_h()) }
     }
 
+    fn unit_layout(&self, text: &str) -> Result<IDWriteTextLayout> {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        unsafe { self.gfx.dwrite.CreateTextLayout(&wide, &self.unit_fmt, 2000.0, self.row_h()) }
+    }
+
+    /// A value as a measured number plus its unit.
+    fn cell(&self, text: &str) -> Result<Cell> {
+        let (num, unit) = metrics::split_unit(text);
+        let num_layout = self.layout(num)?;
+        let num_w = measure(&num_layout);
+        let Some((unit, spaced)) = unit else { return Ok(Cell { num: num_layout, unit: None, w: num_w }) };
+        let layout = self.unit_layout(unit)?;
+        // The space that separated them is replaced by a smaller one, since the unit itself is smaller.
+        let x = num_w + if spaced { (self.cfg.font_size * 0.2).max(2.0) } else { 0.5 };
+        let w = x + measure(&layout);
+        Ok(Cell { num: num_layout, unit: Some(UnitPart { layout, x }), w })
+    }
+
+    /// Distance from the top of a row to the baseline of text drawn with `fmt` (lines are centered in the row).
+    fn baseline(&self, fmt: &IDWriteTextFormat) -> f32 {
+        let wide: Vec<u16> = "0".encode_utf16().collect();
+        unsafe {
+            let Ok(l) = self.gfx.dwrite.CreateTextLayout(&wide, fmt, 200.0, self.row_h()) else { return 0.0 };
+            let mut lm = [DWRITE_LINE_METRICS::default(); 1];
+            let mut n = 0u32;
+            if l.GetLineMetrics(Some(&mut lm), &mut n).is_err() || n == 0 {
+                return 0.0;
+            }
+            (self.row_h() - lm[0].height) / 2.0 + lm[0].baseline
+        }
+    }
+
     fn label_layout(&self, text: &str) -> Result<IDWriteTextLayout> {
         let wide: Vec<u16> = text.encode_utf16().collect();
         unsafe { self.gfx.dwrite.CreateTextLayout(&wide, &self.label_fmt, 2000.0, self.row_h()) }
@@ -176,12 +236,14 @@ impl App {
     fn ensure_font(&mut self) {
         if (self.cfg.font_size - self.fmt_size).abs() > 0.01 {
             let dw = &self.gfx.dwrite;
-            if let (Ok(f), Ok(l)) = (
+            if let (Ok(f), Ok(l), Ok(u)) = (
                 make_format(dw, self.cfg.font_size, DWRITE_FONT_WEIGHT_NORMAL),
                 make_format(dw, label_size(self.cfg.font_size), DWRITE_FONT_WEIGHT_SEMI_BOLD),
+                make_format(dw, unit_size(self.cfg.font_size), DWRITE_FONT_WEIGHT_NORMAL),
             ) {
                 self.fmt = f;
                 self.label_fmt = l;
+                self.unit_fmt = u;
                 self.fmt_size = self.cfg.font_size;
             }
         }
@@ -192,6 +254,7 @@ impl App {
         self.ensure_font();
         self.val_dy = self.cap_dy(&self.fmt, self.cfg.font_size);
         self.label_dy = self.cap_dy(&self.label_fmt, label_size(self.cfg.font_size));
+        self.unit_dy = self.baseline(&self.fmt) - self.baseline(&self.unit_fmt);
         let grid = metrics::widget_grid(&self.cfg, &self.snap);
         let mut blocks: Vec<Block> = Vec::new();
         for b in &grid {
@@ -206,7 +269,8 @@ impl App {
                     continue;
                 }
                 let text_w = label.as_ref().map(measure).unwrap_or(0.0);
-                let label_w = if want_icon { isz } else { 0.0 }
+                let icon_w = if r.arrow.is_some() { (isz * 0.62).round() } else { isz };
+                let label_w = if want_icon { icon_w } else { 0.0 }
                     + if want_icon && want_text { 5.0 } else { 0.0 }
                     + text_w
                     + if badge { 2.0 * BADGE_PAD } else { 0.0 };
@@ -214,11 +278,7 @@ impl App {
                     .cells
                     .iter()
                     .map(|c| {
-                        c.as_ref().and_then(|t| {
-                            let layout = self.layout(t).ok()?;
-                            let w = measure(&layout);
-                            Some(Cell { layout, w })
-                        })
+                        c.as_ref().and_then(|t| self.cell(t).ok())
                     })
                     .collect();
                 // Rows that don't share columns reserve room per value, so each row's spacing is uniform and stable.
@@ -228,13 +288,13 @@ impl App {
                     r.templates
                         .iter()
                         .zip(&cells)
-                        .map(|(t, c): (&&str, &Option<Cell>)| {
-                            let reserve = self.layout(t).map(|l| measure(&l)).unwrap_or(0.0);
+                        .map(|(t, c): (&String, &Option<Cell>)| {
+                            let reserve = self.cell(t).map(|c| c.w).unwrap_or(0.0);
                             c.as_ref().map_or(reserve, |c| reserve.max(c.w))
                         })
                         .collect()
                 };
-                rows.push(GRow { icon: want_icon.then_some(r.section), label, label_w, cells, col_w });
+                rows.push(GRow { icon: want_icon.then_some(r.section), arrow: r.arrow, icon_w, label, label_w, cells, col_w });
             }
             let label_w = rows.iter().map(|r| r.label_w).fold(0.0, f32::max);
             // Each column is as wide as the widest value it may show, so it never resizes as numbers change.
@@ -243,7 +303,7 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(i, templates)| {
-                    let reserve = templates.iter().map(|t| self.layout(t).map(|l| measure(&l)).unwrap_or(0.0)).fold(0.0, f32::max);
+                    let reserve = templates.iter().map(|t| self.cell(t).map(|c| c.w).unwrap_or(0.0)).fold(0.0, f32::max);
                     rows.iter().filter_map(|r| r.cells.get(i).and_then(|c| c.as_ref()).map(|c| c.w)).fold(reserve, f32::max)
                 })
                 .collect();
@@ -252,11 +312,11 @@ impl App {
         if blocks.is_empty() {
             // Nothing to show yet (or nothing pinned): a single hint line.
             let msg = if self.cfg.pinned.is_empty() { "click to choose metrics" } else { "waiting for sensors" };
-            if let (Ok(label), Ok(layout)) = (self.label_layout("TaskbarHWM"), self.layout(msg)) {
-                let w = measure(&layout);
+            if let (Ok(label), Ok(cell)) = (self.label_layout("TaskbarHWM"), self.cell(msg)) {
+                let w = cell.w;
                 let label_w = measure(&label);
                 blocks.push(Block {
-                    rows: vec![GRow { icon: None, label: Some(label), label_w, cells: vec![Some(Cell { layout, w })], col_w: Vec::new() }],
+                    rows: vec![GRow { icon: None, arrow: None, icon_w: 0.0, label: Some(label), label_w, cells: vec![Some(cell)], col_w: Vec::new() }],
                     shared: true,
                     badge: false,
                     label_w,
@@ -300,8 +360,22 @@ impl App {
             let w_px = ((self.width_dip + EDGE) * scale).ceil() as i32;
             self.pos = (r.left, r.top);
             let _ = self.surface.resize(w_px as u32, th as u32, dpi);
-            // Size and position are applied by UpdateLayeredWindow in render(); this keeps us shown and on top.
-            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            // Size and position are applied by UpdateLayeredWindow in render(); the rest keeps us shown and on top.
+            //
+            // The taskbar owns us: Windows keeps an owned window directly above its owner, so when the taskbar
+            // raises itself (a right-click on it, an app opening from it) we are raised in the same step instead of
+            // staying hidden until the next tick. It also means we never have to push ourselves above other
+            // topmost windows, such as menus and jump lists, just to be seen.
+            if GetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT) != tray.0 as isize {
+                SetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT, tray.0 as isize);
+            }
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+            if !IsWindowVisible(self.hwnd).as_bool() || (!MENU_OPEN.load(Ordering::Relaxed) && is_below(self.hwnd, tray)) {
+                // Only when the taskbar has actually ended up above us (and no menu of ours is open): never over a menu.
+                let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+            } else {
+                let _ = SetWindowPos(self.hwnd, None, 0, 0, 0, 0, flags | SWP_NOZORDER);
+            }
         }
     }
 
@@ -313,13 +387,15 @@ impl App {
         let blocks = &self.blocks;
         let (row_h, col_gap, label_gap, block_gap) = (self.row_h(), self.col_gap(), self.label_gap(), self.block_gap());
         let isz = self.icon_size();
-        let (val_dy, label_dy) = (self.val_dy, self.label_dy);
+        let (val_dy, label_dy, unit_dy) = (self.val_dy, self.label_dy, self.unit_dy);
         let (px, py) = self.pos;
         let _ = self.surface.present(self.hwnd, px, py, |dc| unsafe {
             let Ok(text) = dc.CreateSolidColorBrush(&t.text, None) else { return };
             let Ok(dim) = dc.CreateSolidColorBrush(&t.text_secondary, None) else { return };
             let Ok(badge_fill) = dc.CreateSolidColorBrush(&t.badge_fill, None) else { return };
             let Ok(badge_text) = dc.CreateSolidColorBrush(&t.badge_text, None) else { return };
+            // Units: the text color pulled most of the way toward the secondary color.
+            let Ok(unit_brush) = dc.CreateSolidColorBrush(&mix(t.text, t.text_secondary, 0.7), None) else { return };
             // Near-invisible fill over the whole area: layered windows are click-through where alpha is 0.
             if let Ok(b) = dc.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 / 255.0 }, None) {
                 dc.FillRectangle(&D2D_RECT_F { left: 0.0, top: 0.0, right: w_dip, bottom: h_dip }, &b);
@@ -352,8 +428,12 @@ impl App {
                     if let Some(section) = row.icon {
                         // Without a badge, an icon that is the row's only label uses the full text color.
                         let brush = if blk.badge || row.label.is_some() { label_brush } else { &text };
-                        super::icons::draw(dc, brush, section, lx, y + (row_h - isz) / 2.0, isz);
-                        lx += isz + if row.label.is_some() { 5.0 } else { 0.0 };
+                        match row.arrow {
+                            // The arrow sits in the middle of its square: shift so that middle is the middle of the narrower slot.
+                            Some(a) => super::icons::draw_arrow(dc, brush, a, lx + row.icon_w / 2.0 - isz / 2.0, y + (row_h - isz) / 2.0, isz),
+                            None => super::icons::draw(dc, brush, section, lx, y + (row_h - isz) / 2.0, isz),
+                        }
+                        lx += row.icon_w + if row.label.is_some() { 5.0 } else { 0.0 };
                     }
                     if let Some(label) = &row.label {
                         dc.DrawTextLayout(Vector2 { X: lx, Y: y + label_dy }, label, label_brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
@@ -363,7 +443,11 @@ impl App {
                     for (i, col_w) in widths.iter().enumerate() {
                         if let Some(Some(cell)) = row.cells.get(i) {
                             // Right-aligned: digits of different rows line up on their right edge.
-                            dc.DrawTextLayout(Vector2 { X: cx + col_w - cell.w, Y: y + val_dy }, &cell.layout, &text, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            let x0 = cx + col_w - cell.w;
+                            dc.DrawTextLayout(Vector2 { X: x0, Y: y + val_dy }, &cell.num, &text, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            if let Some(u) = &cell.unit {
+                                dc.DrawTextLayout(Vector2 { X: x0 + u.x, Y: y + val_dy + unit_dy }, &u.layout, &unit_brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            }
                         }
                         cx += col_w + col_gap;
                     }
@@ -385,6 +469,21 @@ impl App {
             theme: self.theme,
             dwrite: &self.gfx.dwrite,
             settings,
+        });
+    }
+
+    /// Opens the settings page, whether or not the flyout is already open.
+    fn open_settings(&self) {
+        let scale = self.surface.dpi / 96.0;
+        super::flyout::show_settings(super::flyout::OpenParams {
+            anchor_x: self.pos.0 + (EDGE * scale) as i32,
+            taskbar_top: self.pos.1,
+            scale,
+            widget: self.hwnd,
+            snap: &self.snap,
+            theme: self.theme,
+            dwrite: &self.gfx.dwrite,
+            settings: true,
         });
     }
 
@@ -448,17 +547,71 @@ fn spawn_sampler(hwnd: HWND, shared: Arc<Mutex<Snapshot>>) {
     });
 }
 
+/// Lets this app's menus follow the system's light or dark mode (they are always light otherwise).
+/// Uses the two uxtheme exports Windows' own shell uses for this (by ordinal: SetPreferredAppMode, FlushMenuThemes);
+/// if they are missing the menu just stays light.
+fn allow_dark_menus() {
+    use windows::core::PCSTR;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let Ok(ux) = LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) else { return };
+        let set_mode = GetProcAddress(ux, PCSTR(135 as *const u8));
+        let flush = GetProcAddress(ux, PCSTR(136 as *const u8));
+        if let (Some(set_mode), Some(flush)) = (set_mode, flush) {
+            let set_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(set_mode);
+            let flush: unsafe extern "system" fn() = std::mem::transmute(flush);
+            set_mode(1); // APPMODE_ALLOWDARK: follow the system setting
+            flush();
+        }
+    });
+}
+
+/// True while the right-click menu is on screen, so the widget doesn't re-raise itself over it.
+static MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `other` is above `window` in the z-order.
+fn is_below(window: HWND, other: HWND) -> bool {
+    unsafe {
+        let mut w = GetWindow(window, GW_HWNDPREV).ok();
+        for _ in 0..4096 {
+            match w {
+                Some(h) if h == other => return true,
+                Some(h) => w = GetWindow(h, GW_HWNDPREV).ok(),
+                None => return false,
+            }
+        }
+        false
+    }
+}
+
+const MENU_SETTINGS: usize = 1;
+const MENU_EXIT: usize = 2;
+
 fn show_context_menu(hwnd: HWND) {
+    allow_dark_menus();
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let _ = AppendMenuW(menu, MF_STRING, 1, w!("Exit"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("Settings"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit"));
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
+        // Open the menu above the widget instead of over it (bottom edge at the widget's top edge).
+        let mut wr = RECT::default();
+        let y = if GetWindowRect(hwnd, &mut wr).is_ok() { wr.top } else { pt.y };
         let _ = SetForegroundWindow(hwnd);
-        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None);
+        MENU_OPEN.store(true, Ordering::Relaxed);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON, pt.x, y, None, hwnd, None);
+        MENU_OPEN.store(false, Ordering::Relaxed);
         let _ = DestroyMenu(menu);
-        if cmd.0 == 1 {
-            PostQuitMessage(0);
+        match cmd.0 as usize {
+            MENU_SETTINGS => {
+                // Not opened here: the menu ran inside this message, and the flyout is driven from the app's own handler.
+                let _ = PostMessageW(Some(hwnd), WM_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+            }
+            MENU_EXIT => PostQuitMessage(0),
+            _ => {}
         }
     }
 }
@@ -484,6 +637,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         let Some(app) = guard.as_mut() else { return false };
         match msg {
             WM_SNAPSHOT => app.on_snapshot(),
+            WM_OPEN_SETTINGS => app.open_settings(),
             crate::shell::setup::WM_SETUP => super::flyout::update(&app.snap),
             WM_CONFIG => {
                 app.cfg = crate::config::get();
@@ -575,6 +729,7 @@ pub fn run(cfg: Config) -> Result<()> {
         let fsize = cfg.font_size;
         let fmt = make_format(&gfx.dwrite, fsize, DWRITE_FONT_WEIGHT_NORMAL)?;
         let label_fmt = make_format(&gfx.dwrite, label_size(fsize), DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+        let unit_fmt = make_format(&gfx.dwrite, unit_size(fsize), DWRITE_FONT_WEIGHT_NORMAL)?;
 
         let shared = Arc::new(Mutex::new(Snapshot::default()));
         let mut app = App {
@@ -588,6 +743,8 @@ pub fn run(cfg: Config) -> Result<()> {
             fmt,
             fmt_size: fsize,
             label_fmt,
+            unit_fmt,
+            unit_dy: 0.0,
             val_dy: 0.0,
             label_dy: 0.0,
             blocks: Vec::new(),

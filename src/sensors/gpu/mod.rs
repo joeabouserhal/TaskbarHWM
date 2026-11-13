@@ -1,3 +1,5 @@
+mod adlx;
+mod kmt;
 mod nvml;
 
 use super::pdh::{Counter, Query};
@@ -7,8 +9,11 @@ use windows::Win32::Graphics::Dxgi::*;
 #[derive(Clone, Debug, Default)]
 pub struct GpuStats {
     pub name: String,
+    /// Stable id used to remember which GPUs the user chose (the adapter name, with " #2" for a second identical card).
+    pub key: String,
+    /// Integrated graphics (shares system memory) as opposed to a discrete card.
+    pub integrated: bool,
     pub vendor: Vendor,
-    pub luid: String,
     pub usage_percent: Option<f32>,
     pub temp_c: Option<f32>,
     pub power_w: Option<f32>,
@@ -30,16 +35,23 @@ pub enum Vendor {
 
 struct Adapter {
     name: String,
+    key: String,
+    integrated: bool,
+    /// Vendor-neutral kernel telemetry (temperature) for this adapter, when the driver supports it.
+    kmt: Option<kmt::KmtAdapter>,
     vendor: Vendor,
     luid: (u32, i32),
     dedicated: u64,
     /// Index into the NVML device list when this adapter is an NVIDIA GPU we can query.
     nv_index: Option<usize>,
+    /// Index into the ADLX GPU list when this adapter is an AMD GPU we can query.
+    adlx_index: Option<usize>,
 }
 
 pub struct GpuSampler {
     adapters: Vec<Adapter>,
     nvml: Option<nvml::Nvml>,
+    adlx: Option<adlx::Adlx>,
     q: Option<Query>,
     engine: Option<Counter>,
     vram: Option<Counter>,
@@ -74,12 +86,18 @@ impl GpuSampler {
                         0x8086 => Vendor::Intel,
                         _ => Vendor::Other,
                     };
+                    let name = String::from_utf16_lossy(&d.Description[..end]);
                     adapters.push(Adapter {
-                        name: String::from_utf16_lossy(&d.Description[..end]),
+                        key: name.clone(),
+                        name,
+                        // Integrated GPUs reserve only a sliver of dedicated memory and borrow system RAM.
+                        integrated: (d.DedicatedVideoMemory as u64) < (1u64 << 30),
+                        kmt: None,
                         vendor,
                         luid: (d.AdapterLuid.LowPart, d.AdapterLuid.HighPart),
                         dedicated: d.DedicatedVideoMemory as u64,
                         nv_index: None,
+                        adlx_index: None,
                     });
                 }
             }
@@ -100,6 +118,37 @@ impl GpuSampler {
                 }
             }
         }
+        // Same for AMD adapters and ADLX GPUs (the library is only loaded when there is an AMD adapter).
+        let adlx = if adapters.iter().any(|a| a.vendor == Vendor::Amd) { adlx::Adlx::load() } else { None };
+        if let Some(x) = &adlx {
+            let list = x.gpus();
+            let mut used = vec![false; list.len()];
+            for a in adapters.iter_mut().filter(|a| a.vendor == Vendor::Amd) {
+                let pos = list
+                    .iter()
+                    .enumerate()
+                    .position(|(i, (nm, integ))| !used[i] && *nm == a.name && *integ == a.integrated)
+                    .or_else(|| list.iter().enumerate().position(|(i, (nm, _))| !used[i] && *nm == a.name));
+                if let Some(p) = pos {
+                    used[p] = true;
+                    a.adlx_index = Some(p);
+                }
+            }
+        }
+        // Discrete cards first (GPU 1), integrated graphics after; DXGI order within each group.
+        adapters.sort_by_key(|a| a.integrated);
+        // Two identical cards would share a name: keep the keys unique.
+        for i in 1..adapters.len() {
+            let dup = adapters[..i].iter().filter(|b| b.name == adapters[i].name).count();
+            if dup > 0 {
+                adapters[i].key = format!("{} #{}", adapters[i].name, dup + 1);
+            }
+        }
+        if let Some(k) = kmt::Kmt::load() {
+            for a in adapters.iter_mut() {
+                a.kmt = k.adapter(a.luid.0, a.luid.1);
+            }
+        }
         let q = Query::new();
         let (engine, vram) = match &q {
             Some(q) => {
@@ -110,7 +159,7 @@ impl GpuSampler {
             }
             None => (None, None),
         };
-        GpuSampler { adapters, nvml, q, engine, vram }
+        GpuSampler { adapters, nvml, adlx, q, engine, vram }
     }
 
     pub fn sample(&mut self) -> Vec<GpuStats> {
@@ -148,8 +197,9 @@ impl GpuSampler {
                 let key = luid_key(a.luid);
                 let mut g = GpuStats {
                     name: a.name.clone(),
+                    key: a.key.clone(),
+                    integrated: a.integrated,
                     vendor: a.vendor,
-                    luid: key.clone(),
                     usage_percent: usage.get(&key).map(|v| v.clamp(0.0, 100.0)),
                     vram_used: vram.get(&key).copied(),
                     vram_total: (a.dedicated > 0).then_some(a.dedicated),
@@ -166,6 +216,18 @@ impl GpuSampler {
                     g.vram_used = s.vram_used.or(g.vram_used);
                     g.vram_total = s.vram_total.or(g.vram_total);
                     g.fan_percent = s.fan_percent;
+                }
+                if let (Some(x), Some(i)) = (&self.adlx, a.adlx_index) {
+                    let s = x.read(i);
+                    g.usage_percent = s.usage.or(g.usage_percent);
+                    g.temp_c = s.temp_c;
+                    g.power_w = s.power_w;
+                    g.core_mhz = s.core_mhz;
+                    g.mem_mhz = s.mem_mhz;
+                }
+                // Any driver that reports it through the graphics kernel (AMD, Intel, ...) gets a temperature too.
+                if g.temp_c.is_none() {
+                    g.temp_c = a.kmt.as_ref().and_then(|k| k.temperature_c());
                 }
                 g
             })
