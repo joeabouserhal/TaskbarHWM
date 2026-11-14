@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D_RECT_F};
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -570,7 +571,8 @@ impl App {
 
     fn on_tick(&mut self) {
         let state = unsafe { SHQueryUserNotificationState() };
-        let fullscreen = matches!(state, Ok(s) if s == QUNS_BUSY || s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE);
+        let fullscreen = matches!(state, Ok(s) if s == QUNS_BUSY || s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE)
+            && fullscreen_app_in_front();
         self.hidden_fullscreen = fullscreen;
         self.theme = Theme::current();
         // Displays and taskbars come and go; re-asserting position also keeps us above a taskbar that re-raises itself.
@@ -582,11 +584,70 @@ impl App {
     }
 }
 
+/// Puts a widget window back above its taskbar if the taskbar has ended up on top of it.
+unsafe fn raise_if_covered(w: &Win) {
+    if IsWindowVisible(w.hwnd).as_bool() && !MENU_OPEN.load(Ordering::Relaxed) && is_below(w.hwnd, w.tray) {
+        let _ = SetWindowPos(w.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+/// WinEvent hook: something in the system was raised or reordered.
+unsafe extern "system" fn on_z_event(_hook: HWINEVENTHOOK, event: u32, _hwnd: HWND, _object: i32, _child: i32, _thread: u32, _time: u32) {
+    APP.with(|cell| {
+        // A new foreground window can mean a fullscreen app came or went: check right away instead of at the next tick.
+        if event == EVENT_SYSTEM_FOREGROUND {
+            if let Ok(mut guard) = cell.try_borrow_mut() {
+                if let Some(app) = guard.as_mut() {
+                    app.on_tick();
+                    return;
+                }
+            }
+        }
+        if let Ok(guard) = cell.try_borrow() {
+            if let Some(app) = guard.as_ref() {
+                for w in &app.wins {
+                    raise_if_covered(w);
+                }
+            }
+        }
+    });
+}
+
+const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+const EVENT_OBJECT_REORDER: u32 = 0x8004;
+
+/// Whether an application window is really covering a whole screen (a fullscreen game or video).
+///
+/// Windows' own "busy" flag is not enough on its own: it also reads as busy while the desktop is in front (after
+/// Win+D) and for some dialogs. So the window in front must be a normal application window that fills its monitor.
+fn fullscreen_app_in_front() -> bool {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() || !IsWindowVisible(fg).as_bool() || IsIconic(fg).as_bool() {
+            return false;
+        }
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(fg, &mut buf).max(0) as usize;
+        let class = String::from_utf16_lossy(&buf[..n]);
+        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+            return false;
+        }
+        let mut r = RECT::default();
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetWindowRect(fg, &mut r).is_err() || !GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+            return false;
+        }
+        let m = mi.rcMonitor;
+        r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+    }
+}
+
 /// Positions a widget window over the left end of its taskbar and resizes its bitmap to match.
 fn place_win(w: &mut Win, width_dip: f32, hidden: bool) {
     unsafe {
         if hidden {
-            let _ = ShowWindow(w.hwnd, SW_HIDE);
+            hide_self(w.hwnd);
             return;
         }
         let tray = w.tray;
@@ -597,7 +658,7 @@ fn place_win(w: &mut Win, width_dip: f32, hidden: bool) {
         let (tw, th) = (r.right - r.left, r.bottom - r.top);
         if tw < th {
             // Vertical taskbars aren't supported yet.
-            let _ = ShowWindow(w.hwnd, SW_HIDE);
+            hide_self(w.hwnd);
             return;
         }
         let dpi = GetDpiForWindow(tray).max(96) as f32;
@@ -681,6 +742,16 @@ fn quit_now() -> ! {
     std::process::exit(0)
 }
 
+/// Set while this app is hiding its own widget windows on purpose.
+static SELF_HIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Hides one of our widget windows, bypassing the guard against the system hiding it.
+unsafe fn hide_self(hwnd: HWND) {
+    SELF_HIDE.store(true, Ordering::Relaxed);
+    let _ = ShowWindow(hwnd, SW_HIDE);
+    SELF_HIDE.store(false, Ordering::Relaxed);
+}
+
 /// True while the right-click menu is on screen, so the widget doesn't re-raise itself over it.
 static MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -738,6 +809,14 @@ static CONTROLLER: AtomicIsize = AtomicIsize::new(0);
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        // Windows hides every window it can on Win+D ("show desktop"); the widget should stay, so that hide is cancelled
+        // as it happens (hiding it ourselves, for a fullscreen app, is the only hide that goes through).
+        WM_WINDOWPOSCHANGING if !SELF_HIDE.load(Ordering::Relaxed) => {
+            let pos = &mut *(lp.0 as *mut WINDOWPOS);
+            if pos.flags.contains(SWP_HIDEWINDOW) {
+                pos.flags &= !SWP_HIDEWINDOW;
+            }
+        }
         // Handled outside the APP borrow: the menu runs a nested message loop.
         WM_RBUTTONUP => {
             show_context_menu(hwnd);
@@ -877,6 +956,12 @@ pub fn run(cfg: Config) -> Result<()> {
         APP.with(|c| *c.borrow_mut() = Some(app));
 
         SetTimer(Some(controller), TIMER_TICK, 1000, None);
+        // The taskbar jumps above the widget whenever it is raised (Win+D, clicking it, opening Start); the tick would
+        // put the widget back a moment later, which shows as a flicker. These events let it go back right away.
+        const WINEVENT_OUTOFCONTEXT: u32 = 0;
+        for event in [EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_REORDER] {
+            let _ = SetWinEventHook(event, event, None, Some(on_z_event), 0, 0, WINEVENT_OUTOFCONTEXT);
+        }
         spawn_sampler(controller, shared);
 
         let mut msg = MSG::default();

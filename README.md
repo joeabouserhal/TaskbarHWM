@@ -169,7 +169,7 @@ powershell -File scripts\build-installer.ps1
 
 Builds the app, then compiles `installer\TaskbarHWM.iss`.
 
-Silent install for scripts: `TaskbarHWM-Setup-0.1.1.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
+Silent install for scripts: `TaskbarHWM-Setup-0.1.2.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
 (add `/TASKS="!autostart"` to skip autostart). `/DRYRUNPAWNIO` pretends PawnIO is missing and only downloads and
 verifies its installer, which is useful for testing.
 
