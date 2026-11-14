@@ -1,3 +1,4 @@
+pub mod claude;
 pub mod cpu;
 pub mod cpu_pawnio;
 pub mod disk;
@@ -13,6 +14,7 @@ pub struct Snapshot {
     pub gpus: Vec<gpu::GpuStats>,
     pub disks: Vec<disk::DiskStats>,
     pub net: net::NetStats,
+    pub claude: claude::ClaudeStats,
     /// Why CPU temperature/power are unavailable (None = working or not yet known).
     pub pawn: Option<cpu_pawnio::Unavailable>,
 }
@@ -22,11 +24,12 @@ pub struct Sampler {
     gpu: gpu::GpuSampler,
     disk: disk::DiskSampler,
     net: net::NetSampler,
+    claude: claude::ClaudeSampler,
 }
 
 impl Sampler {
     pub fn new() -> Sampler {
-        Sampler { cpu: cpu::CpuSampler::new(), gpu: gpu::GpuSampler::new(), disk: disk::DiskSampler::new(), net: net::NetSampler::new() }
+        Sampler { cpu: cpu::CpuSampler::new(), gpu: gpu::GpuSampler::new(), disk: disk::DiskSampler::new(), net: net::NetSampler::new(), claude: claude::ClaudeSampler::new() }
     }
 
     /// Why CPU temperature/power are unavailable (None = working).
@@ -51,6 +54,7 @@ impl Sampler {
             gpus,
             disks: self.disk.sample(),
             net: self.net.sample(),
+            claude: self.claude.sample(),
             pawn: self.pawn_status().copied(),
         }
     }

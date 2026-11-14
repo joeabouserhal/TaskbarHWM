@@ -1,6 +1,6 @@
 [package]
 name = "taskbar-hwm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Lightweight hardware monitor widget for the Windows taskbar"
 
@@ -51,6 +51,7 @@ features = [
   "Win32_System_Memory",
   "Win32_System_Power",
   "Win32_System_SystemInformation",
+  "Win32_System_Time",
   "Win32_System_Threading",
   "Win32_System_Console",
   "Win32_UI_WindowsAndMessaging",

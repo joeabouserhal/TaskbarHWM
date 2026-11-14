@@ -11,6 +11,7 @@ pub enum Section {
     Ram,
     Disk,
     Net,
+    Claude,
 }
 
 impl Section {
@@ -21,6 +22,7 @@ impl Section {
             Section::Ram => "RAM",
             Section::Disk => "Disks",
             Section::Net => "Net",
+            Section::Claude => "Claude",
         }
     }
 
@@ -32,11 +34,12 @@ impl Section {
             Section::Ram => "ram",
             Section::Disk => "disk",
             Section::Net => "net",
+            Section::Claude => "claude",
         }
     }
 
     pub fn from_key(k: &str) -> Option<Section> {
-        [Section::Cpu, Section::Gpu, Section::Ram, Section::Disk, Section::Net].into_iter().find(|s| s.key() == k)
+        [Section::Cpu, Section::Gpu, Section::Ram, Section::Disk, Section::Net, Section::Claude].into_iter().find(|s| s.key() == k)
     }
 }
 
@@ -54,10 +57,12 @@ pub enum Kind {
     Disk,
     /// Network throughput. Not a taskbar column: the Net row lays its values out by position, like the disks.
     Net,
+    /// Claude usage: likewise laid out by position.
+    Claude,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 9] = [Kind::Usage, Kind::Clock, Kind::Temp, Kind::Power, Kind::Memory, Kind::MemClock, Kind::Fan, Kind::Disk, Kind::Net];
+    pub const ALL: [Kind; 10] = [Kind::Usage, Kind::Clock, Kind::Temp, Kind::Power, Kind::Memory, Kind::MemClock, Kind::Fan, Kind::Disk, Kind::Net, Kind::Claude];
 
     pub fn key(self) -> &'static str {
         match self {
@@ -70,6 +75,7 @@ impl Kind {
             Kind::Fan => "fan",
             Kind::Disk => "disk",
             Kind::Net => "net",
+            Kind::Claude => "claude",
         }
     }
 
@@ -88,6 +94,7 @@ impl Kind {
             Kind::Fan => "Fan",
             Kind::Disk => "Disk",
             Kind::Net => "Network",
+            Kind::Claude => "Claude",
         }
     }
 
@@ -109,11 +116,12 @@ impl Kind {
             Kind::Memory => "99.9 / 999 GB",
             Kind::Disk => disk_template(disk_style, false),
             Kind::Net => "99.9 MB/s",
+            Kind::Claude => "5h 100%",
         }
     }
 }
 
-pub const ROW_KEYS: &[&str] = &["cpu", "gpu", "ram", "disk", "net"];
+pub const ROW_KEYS: &[&str] = &["cpu", "gpu", "ram", "disk", "net", "claude"];
 pub const COL_KEYS: &[&str] = &["usage", "clock", "temp", "power", "vram", "memclock", "fan", "disk"];
 
 pub struct MetricDef {
@@ -141,6 +149,13 @@ pub const METRICS: &[MetricDef] = &[
     MetricDef { id: "ram.used", section: Section::Ram, name: "Used", kind: Kind::Memory },
     MetricDef { id: "net.down", section: Section::Net, name: "Download", kind: Kind::Net },
     MetricDef { id: "net.up", section: Section::Net, name: "Upload", kind: Kind::Net },
+    MetricDef { id: "claude.five_hour", section: Section::Claude, name: "5-hour usage", kind: Kind::Claude },
+    MetricDef { id: "claude.five_reset", section: Section::Claude, name: "5-hour reset", kind: Kind::Claude },
+    MetricDef { id: "claude.weekly", section: Section::Claude, name: "Weekly usage", kind: Kind::Claude },
+    MetricDef { id: "claude.week_reset", section: Section::Claude, name: "Weekly reset", kind: Kind::Claude },
+    MetricDef { id: "claude.week_model", section: Section::Claude, name: "Weekly, one model", kind: Kind::Claude },
+    MetricDef { id: "claude.context", section: Section::Claude, name: "Context window", kind: Kind::Claude },
+    MetricDef { id: "claude.cost", section: Section::Claude, name: "Session cost", kind: Kind::Claude },
 ];
 
 /// Position in the catalog; used to keep user-selected lists in a stable order.
@@ -245,9 +260,30 @@ fn net_template(unit: &str) -> &'static str {
     if unit == "bits" { "99.9 Mbps" } else { "99.9 MB/s" }
 }
 
-/// Formatted value for a CPU, RAM or network metric, or None when the sensor isn't available (the UI hides it).
+/// "2h 14m", "3d 4h", "9m": how long until a limit resets.
+pub fn countdown(secs: i64) -> String {
+    let (d, h, m) = (secs / 86_400, secs % 86_400 / 3_600, secs % 3_600 / 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{}m", m.max(1))
+    }
+}
+
+/// Formatted value for a CPU, RAM, network or Claude metric, or None when the sensor isn't available (the UI hides it).
 pub fn value(id: &str, snap: &Snapshot, cfg: &Config) -> Option<String> {
+    let c = &snap.claude;
+    let now = crate::sensors::claude::now_secs();
     Some(match id {
+        "claude.five_hour" => format!("{:.0}%", c.five_hour_now(now)?),
+        "claude.five_reset" => countdown(c.five_hour_left(now)?),
+        "claude.weekly" => format!("{:.0}%", c.weekly_now(now)?),
+        "claude.week_reset" => countdown(c.weekly_left(now)?),
+        "claude.week_model" => format!("{:.0}%", c.week_model_now(now)?.1),
+        "claude.context" => format!("{:.0}%", c.context_pct?),
+        "claude.cost" => format!("${:.2}", c.cost_usd?),
         "cpu.usage" => format!("{:.0}%", snap.cpu.usage_percent?),
         "cpu.clock" => clock(snap.cpu.clock_mhz?),
         "cpu.temp" => temp(snap.cpu.temp_c?, cfg),
@@ -397,6 +433,8 @@ enum Src<'a> {
     Disks(Vec<&'a DiskStats>),
     /// The network row: download and upload speeds.
     Net,
+    /// The Claude usage row.
+    Claude,
     /// The download speed as a row of its own (the "split" network layout).
     NetDown,
     /// The upload speed as a row of its own.
@@ -406,7 +444,7 @@ enum Src<'a> {
 impl Src<'_> {
     /// Rows whose values don't line up by metric kind (they carry their own arrows or drive letters).
     fn positional(&self) -> bool {
-        matches!(self, Src::Disk(_) | Src::Disks(_) | Src::Net | Src::NetDown | Src::NetUp)
+        matches!(self, Src::Disk(_) | Src::Disks(_) | Src::Net | Src::NetDown | Src::NetUp | Src::Claude)
     }
 }
 
@@ -442,6 +480,11 @@ pub fn widget_grid(cfg: &Config, snap: &Snapshot) -> Vec<GridBlock> {
                     srcs.extend(pinned.into_iter().map(Src::Disk));
                 } else if !pinned.is_empty() {
                     srcs.push(Src::Disks(pinned));
+                }
+            }
+            Some(Section::Claude) => {
+                if section_pinned(cfg, Section::Claude) {
+                    srcs.push(Src::Claude);
                 }
             }
             Some(Section::Net) => {
@@ -524,6 +567,30 @@ pub fn widget_grid(cfg: &Config, snap: &Snapshot) -> Vec<GridBlock> {
                         vec![(t.clone(), widest_like(&t))]
                     }
                     // Arrows say which is which; the template is the widest speed so the row doesn't resize.
+                    // Each value says which window it is for ("5h", "7d"); the template is the widest it gets.
+                    Src::Claude => [
+                        ("claude.five_hour", "5h ", "5h 100%"),
+                        ("claude.five_reset", "5h \u{21BB} ", "5h \u{21BB} 9h 59m"),
+                        ("claude.weekly", "7d ", "7d 100%"),
+                        ("claude.week_reset", "7d \u{21BB} ", "7d \u{21BB} 6d 23h"),
+                        ("claude.context", "ctx ", "ctx 100%"),
+                        ("claude.cost", "", "$99.99"),
+                    ]
+                    .into_iter()
+                    .filter(|(id, _, _)| cfg.pinned.iter().any(|p| p == id))
+                    .filter_map(|(id, prefix, template)| Some((format!("{prefix}{}", value(id, snap, cfg)?), template.to_string())))
+                    .chain(
+                        // The weekly window of one model, named by the model ("7d Fable 0%").
+                        cfg.pinned
+                            .iter()
+                            .any(|p| p == "claude.week_model")
+                            .then(|| {
+                                let (name, _) = snap.claude.week_model_now(crate::sensors::claude::now_secs())?;
+                                Some((format!("7d {name} {}", value("claude.week_model", snap, cfg)?), "7d Sonnet 100%".to_string()))
+                            })
+                            .flatten(),
+                    )
+                    .collect(),
                     // A row of its own is named by its label and arrow icon ("Down"/"Up"), so the value is just the speed.
                     Src::NetDown | Src::NetUp => {
                         let id = if matches!(src, Src::NetDown) { "net.down" } else { "net.up" };
@@ -558,6 +625,7 @@ pub fn widget_grid(cfg: &Config, snap: &Snapshot) -> Vec<GridBlock> {
                         Src::Disk(d) => (Section::Disk, d.root.clone()),
                         Src::Disks(_) => (Section::Disk, Section::Disk.label().to_string()),
                         Src::Net => (Section::Net, Section::Net.label().to_string()),
+                        Src::Claude => (Section::Claude, Section::Claude.label().to_string()),
                         Src::NetDown => (Section::Net, "Down".to_string()),
                         Src::NetUp => (Section::Net, "Up".to_string()),
                     };
@@ -580,6 +648,10 @@ pub fn fraction(id: &str, snap: &Snapshot) -> Option<f32> {
     let f = match id {
         "cpu.usage" => snap.cpu.usage_percent? / 100.0,
         "ram.usage" => snap.ram?.percent / 100.0,
+        "claude.five_hour" => snap.claude.five_hour_now(crate::sensors::claude::now_secs())? / 100.0,
+        "claude.weekly" => snap.claude.weekly_now(crate::sensors::claude::now_secs())? / 100.0,
+        "claude.week_model" => snap.claude.week_model_now(crate::sensors::claude::now_secs())?.1 / 100.0,
+        "claude.context" => snap.claude.context_pct? / 100.0,
         _ => return None,
     };
     Some(f.clamp(0.0, 1.0))
@@ -615,7 +687,7 @@ pub struct Card {
 /// Cards for the flyout: one per section, containing the metrics the user enabled that have data.
 pub fn flyout_cards(cfg: &Config, snap: &Snapshot, cpu_name: &str) -> Vec<Card> {
     let mut cards = Vec::new();
-    for (section, title) in [(Section::Cpu, "CPU"), (Section::Gpu, "GPU"), (Section::Ram, "Memory"), (Section::Net, "Network")] {
+    for (section, title) in [(Section::Cpu, "CPU"), (Section::Gpu, "GPU"), (Section::Ram, "Memory"), (Section::Net, "Network"), (Section::Claude, "Claude")] {
         if section == Section::Gpu {
             // One card per shown GPU, labelled GPU1 / GPU2 when there is more than one.
             let shown = flyout_gpus(cfg, snap);
@@ -642,13 +714,30 @@ pub fn flyout_cards(cfg: &Config, snap: &Snapshot, cpu_name: &str) -> Vec<Card> 
                 continue;
             }
             if let Some(value) = value(id, snap, cfg) {
-                rows.push(RowData { label: d.name.to_string(), value, frac: fraction(id, snap), hot: false });
+                let label = match (id.as_str(), snap.claude.week_model.as_ref()) {
+                    ("claude.week_model", Some((model, _))) => format!("Weekly ({model})"),
+                    _ => d.name.to_string(),
+                };
+                rows.push(RowData { label, value, frac: fraction(id, snap), hot: false });
             }
         }
         if rows.is_empty() {
+            // Claude usage that is switched on but has nothing to show yet: say why, and where to fix it.
+            let wanted = cfg.flyout.iter().any(|id| def(id).is_some_and(|d| d.section == Section::Claude));
+            if section == Section::Claude && wanted {
+                use crate::sensors::claude::Cli;
+                let note = match snap.claude.cli {
+                    Cli::Missing => "Claude Code wasn't found. Click for details.",
+                    Cli::NoLimits => "No usage limits: Claude Code isn't signed in with a plan. Click for details.",
+                    Cli::Failed => "Couldn't read Claude usage. Click for details.",
+                    Cli::Checking | Cli::Idle | Cli::Ok => "Reading Claude usage...",
+                };
+                cards.push(Card { section, title: title.to_string(), subtitle: String::new(), rows, note: Some(note) });
+            }
             continue;
         }
         let subtitle = match section {
+            Section::Claude => snap.claude.model.clone().unwrap_or_default(),
             Section::Cpu => cpu_name.to_string(),
             Section::Gpu | Section::Ram | Section::Disk | Section::Net => String::new(),
         };

@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows::Win32::UI::Shell::IsUserAnAdmin;
+use windows::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::Vector2;
@@ -27,12 +27,20 @@ use crate::metrics::{self, Card, Section, METRICS};
 use crate::sensors::cpu_pawnio::Unavailable;
 use crate::sensors::disk::DiskStats;
 use crate::sensors::Snapshot;
+use crate::sensors::claude::{ClaudeStats, Link};
 use crate::shell::autostart;
+use crate::shell::claude_setup;
+use crate::shell::displays;
 use crate::shell::setup::{self, SetupState};
 
 // Layout, in DIPs.
 const WIDTH: f32 = 340.0;
-const SETTINGS_WIDTH: f32 = 864.0;
+/// Settings: a navigation column on the left and up to two columns of cards beside it.
+const SETTINGS_WIDTH: f32 = PAD + NAV_W + PAD + 2.0 * COL_W + PAD + PAD;
+const NAV_W: f32 = 156.0;
+const NAV_ITEM_H: f32 = 34.0;
+const COL_W: f32 = 272.0;
+const CONTENT_X: f32 = PAD + NAV_W + PAD;
 const PAD: f32 = 12.0;
 const CARD_PAD: f32 = 14.0;
 const HEADER_H: f32 = 40.0;
@@ -81,6 +89,56 @@ fn page_width(p: Page) -> f32 {
     }
 }
 
+/// The pages of the settings window, listed in its navigation column: General and Appearance, then one page for each
+/// kind of metric.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    General,
+    Appearance,
+    Cpu,
+    Gpu,
+    Memory,
+    Disks,
+    Network,
+    Claude,
+}
+
+enum NavIcon {
+    Glyph(&'static str),
+    Section(Section),
+}
+
+impl Tab {
+    const ALL: [Tab; 8] = [Tab::General, Tab::Appearance, Tab::Cpu, Tab::Gpu, Tab::Memory, Tab::Disks, Tab::Network, Tab::Claude];
+    const METRICS: [Tab; 6] = [Tab::Cpu, Tab::Gpu, Tab::Memory, Tab::Disks, Tab::Network, Tab::Claude];
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::General => "General",
+            Tab::Appearance => "Appearance",
+            Tab::Cpu => "CPU",
+            Tab::Gpu => "GPU",
+            Tab::Memory => "Memory",
+            Tab::Disks => "Disks",
+            Tab::Network => "Network",
+            Tab::Claude => "Claude",
+        }
+    }
+
+    fn icon(self) -> NavIcon {
+        match self {
+            Tab::General => NavIcon::Glyph("\u{E713}"),
+            Tab::Appearance => NavIcon::Glyph("\u{E771}"),
+            Tab::Cpu => NavIcon::Section(Section::Cpu),
+            Tab::Gpu => NavIcon::Section(Section::Gpu),
+            Tab::Memory => NavIcon::Section(Section::Ram),
+            Tab::Disks => NavIcon::Section(Section::Disk),
+            Tab::Network => NavIcon::Section(Section::Net),
+            Tab::Claude => NavIcon::Section(Section::Claude),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {
     Flyout,
@@ -109,6 +167,23 @@ enum Action {
     Chip(ListKind, usize),
     OpenSettings,
     Back,
+    /// Switch the settings page to this tab.
+    Tab(Tab),
+    /// Open the settings page on this tab (from a note on the dashboard).
+    OpenTab(Tab),
+    /// Add TaskbarHWM to Claude Code's status line, or take it out again.
+    ClaudeConnect,
+    ClaudeDisconnect,
+    /// How often Claude usage is read, in minutes.
+    ClaudePoll(u32),
+    /// Show the widget on every display (and any added later), or on the displays currently connected.
+    DisplayAll(bool),
+    /// Toggle display `index` (into the live display list) for the widget.
+    DisplayToggle(usize),
+    /// Open the folder that holds config.toml.
+    OpenFolder,
+    /// Open the project page in the browser.
+    OpenUrl,
     Toggle(&'static str, Target),
     Fahrenheit(bool),
     Interval(u32),
@@ -179,6 +254,12 @@ struct Fly {
     max_h_dip: f32,
     opened: Instant,
     page: Page,
+    /// Which tab of the settings page is showing.
+    tab: Tab,
+    /// The last thing that went wrong when connecting Claude Code, shown on the Claude page.
+    claude_msg: Option<String>,
+    /// What the page shows for the connection until the next reading confirms it (so a click feels instant).
+    claude_link: Option<Link>,
     scroll: f32,
     max_scroll: f32,
     mouse: Option<(f32, f32)>,
@@ -232,6 +313,9 @@ pub fn show_settings(mut p: OpenParams) {
 pub fn update(snap: &Snapshot) {
     with_fly(|f| {
         f.snap = snap.clone();
+        if f.claude_link == Some(f.snap.claude.link) {
+            f.claude_link = None;
+        }
         f.render();
     });
 }
@@ -311,6 +395,8 @@ fn make_fmts(dw: &IDWriteFactory) -> Result<Fmts> {
 }
 
 fn open(p: OpenParams) -> Result<()> {
+    // Opening the flyout is a good moment for fresh Claude numbers (the poller ignores this when it just read them).
+    crate::sensors::claude::request_refresh();
     unsafe {
         let hinst = GetModuleHandleW(None)?;
         let class = w!("TaskbarHWM.Flyout");
@@ -362,6 +448,9 @@ fn open(p: OpenParams) -> Result<()> {
             max_h_dip: (p.taskbar_top as f32 - gap - SCREEN_MARGIN * p.scale) / p.scale,
             opened: Instant::now(),
             page: start_page,
+            tab: Tab::General,
+            claude_msg: None,
+            claude_link: None,
             scroll: 0.0,
             max_scroll: 0.0,
             mouse: None,
@@ -539,6 +628,24 @@ impl<'a> Painter<'a> {
         self.text(unit, &fm.unit, D2D_RECT_F { top: r.top + dy, bottom: r.bottom + dy, ..r }, muted);
     }
 
+    /// One entry of the settings navigation column: icon and name, with a pill and fill when it is the open page.
+    fn nav_item(&mut self, x: f32, y: f32, tab: Tab, selected: bool) {
+        let r = rect(x, y, x + NAV_W, y + NAV_ITEM_H);
+        self.hit(r, Action::Tab(tab));
+        if selected {
+            self.fill(r, 4.0, self.t.hover_fill);
+            self.fill(rect(x + 1.0, y + NAV_ITEM_H / 2.0 - 8.0, x + 4.0, y + NAV_ITEM_H / 2.0 + 8.0), 1.5, self.t.accent);
+        } else if self.hovered(self.map(r)) {
+            self.fill(r, 4.0, self.t.hover_fill);
+        }
+        let c = self.t.text;
+        match tab.icon() {
+            NavIcon::Glyph(g) => self.text(g, &self.fm.icon, rect(x + 10.0, y, x + 30.0, y + NAV_ITEM_H), c),
+            NavIcon::Section(sec) => self.icon(sec, rect(x + 12.0, y + NAV_ITEM_H / 2.0 - 8.0, x + 28.0, y + NAV_ITEM_H / 2.0 + 8.0), c),
+        }
+        self.text(tab.label(), &self.fm.row_label, rect(x + 40.0, y, x + NAV_W - 6.0, y + NAV_ITEM_H), c);
+    }
+
     fn hit(&mut self, r: D2D_RECT_F, a: Action) {
         let mut m = self.map(r);
         if self.in_body {
@@ -683,6 +790,14 @@ impl<'a> Painter<'a> {
         }
     }
 
+    /// An "on" toggle that cannot be changed (the last display that must stay on): dimmed, no hover, not clickable.
+    fn toggle_locked(&mut self, x: f32, y: f32) {
+        let mut c = self.t.accent;
+        c.a = 0.4;
+        self.fill(rect(x, y, x + 40.0, y + 20.0), 10.0, c);
+        self.circle(x + 30.0, y + 10.0, 6.0, color(255, 255, 255, 0.75));
+    }
+
     /// "-  value  +" spin control, right-aligned at `right`. A button is `None` when its limit is reached.
     fn stepper(&mut self, right: f32, y: f32, value: &str, minus: Option<Action>, plus: Option<Action>) {
         const BW: f32 = 28.0;
@@ -726,6 +841,13 @@ impl<'a> Painter<'a> {
                 self.text(label, &self.fm.seg, r, self.t.text);
             }
         }
+    }
+}
+
+/// Opens a folder or web address with whatever Windows has registered for it.
+fn open_with_shell(target: &str) {
+    unsafe {
+        ShellExecuteW(None, w!("open"), &windows::core::HSTRING::from(target), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
     }
 }
 
@@ -778,7 +900,14 @@ fn dashboard_body(p: &mut Painter, cards: &[Card]) -> f32 {
         }
         if let Some(n) = c.note {
             let r = rect(x0, ry + 2.0, x1, ry + 2.0 + NOTE_H);
-            p.hit(r, Action::OpenSettings);
+            p.hit(
+                r,
+                match c.section {
+                    Section::Cpu => Action::OpenTab(Tab::Cpu),
+                    Section::Claude => Action::OpenTab(Tab::Claude),
+                    _ => Action::OpenSettings,
+                },
+            );
             if p.hovered(p.map(r)) {
                 p.fill(r, 4.0, p.t.hover_fill);
             }
@@ -799,17 +928,18 @@ fn dashboard_body(p: &mut Painter, cards: &[Card]) -> f32 {
 }
 
 /// A card of per-metric toggles for one hardware section. Returns the card height.
-fn metrics_card(p: &mut Painter, x: f32, y: f32, w: f32, title: &str, section: Section, cfg: &Config) -> f32 {
-    metrics_card_with(p, x, y, w, title, section, cfg, 0).0
+fn metrics_card(p: &mut Painter, x: f32, y: f32, w: f32, title: &str, subtitle: &str, section: Section, cfg: &Config) -> f32 {
+    metrics_card_with(p, x, y, w, title, subtitle, section, cfg, 0).0
 }
 
 /// [`metrics_card`] with room for `extra_rows` more settings rows under the toggles. Returns the card height and
-/// the y where those extra rows start.
-fn metrics_card_with(p: &mut Painter, x: f32, y: f32, w: f32, title: &str, section: Section, cfg: &Config, extra_rows: usize) -> (f32, f32) {
+/// the y where those extra rows start. `subtitle` is a line under the title naming the hardware ("AMD Ryzen 7 ...").
+fn metrics_card_with(p: &mut Painter, x: f32, y: f32, w: f32, title: &str, subtitle: &str, section: Section, cfg: &Config, extra_rows: usize) -> (f32, f32) {
     let fm = p.fm;
     let rh = p.rh();
     let defs: Vec<_> = METRICS.iter().filter(|m| m.section == section).collect();
-    let h = 10.0 + CARD_TITLE_H + 2.0 + (defs.len() + extra_rows) as f32 * rh + 10.0;
+    let sub_h = if subtitle.is_empty() { 0.0 } else { 20.0 };
+    let h = 10.0 + CARD_TITLE_H + 2.0 + sub_h + (defs.len() + extra_rows) as f32 * rh + 10.0;
     p.card(x, y, w, h);
     let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
     let pin_x = x1 - 40.0;
@@ -819,7 +949,10 @@ fn metrics_card_with(p: &mut Painter, x: f32, y: f32, w: f32, title: &str, secti
     p.text(title, &fm.card_title, rect(x0 + 24.0, ty, x0 + 110.0, ty + CARD_TITLE_H), p.t.text);
     p.text("Flyout", &fm.small, rect(fly_x - 14.0, ty, fly_x + 54.0, ty + CARD_TITLE_H), p.t.text_secondary);
     p.text("Taskbar", &fm.small, rect(pin_x - 14.0, ty, pin_x + 54.0, ty + CARD_TITLE_H), p.t.text_secondary);
-    let mut ry = ty + CARD_TITLE_H + 2.0;
+    if sub_h > 0.0 {
+        p.text(subtitle, &fm.row_label, rect(x0, ty + CARD_TITLE_H - 2.0, x1, ty + CARD_TITLE_H + 18.0), p.t.text_secondary);
+    }
+    let mut ry = ty + CARD_TITLE_H + 2.0 + sub_h;
     for d in defs {
         p.text(d.name, &fm.label, rect(x0, ry, x0 + 120.0, ry + rh), p.t.text);
         let toggle_y = ry + (rh - 20.0) / 2.0;
@@ -831,10 +964,10 @@ fn metrics_card_with(p: &mut Painter, x: f32, y: f32, w: f32, title: &str, secti
 }
 
 /// Network speeds: which to show, and whether they read in bytes or bits per second.
-fn network_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config) -> f32 {
+fn network_card(p: &mut Painter, x: f32, y: f32, w: f32, subtitle: &str, cfg: &Config) -> f32 {
     let fm = p.fm;
     let rh = p.rh();
-    let (h, mut ry) = metrics_card_with(p, x, y, w, "Network", Section::Net, cfg, 2);
+    let (h, mut ry) = metrics_card_with(p, x, y, w, "Network", subtitle, Section::Net, cfg, 2);
     let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
     p.text("Speed unit", &fm.label, rect(x0, ry, x0 + 100.0, ry + rh), p.t.text);
     let u = cfg.net_unit.as_str();
@@ -1040,6 +1173,189 @@ fn disks_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config, view: &View
     h
 }
 
+/// What reading `claude /usage` has found, and how often to read it.
+fn claude_usage_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config, view: &View) -> f32 {
+    use crate::sensors::claude::Cli;
+    let fm = p.fm;
+    let rh = p.rh();
+    let c = &view.claude;
+    let age = c.polled.map(|t| (crate::sensors::claude::now_secs() - t).max(0));
+    let (tone, status, desc): (D2D1_COLOR_F, &str, String) = match c.cli {
+        Cli::Idle => (p.t.text_secondary, "Not reading yet", "Turn on a Claude reading to start. Usage is read with Claude Code's /usage command.".into()),
+        Cli::Checking => (p.t.warn, "Reading usage", "Asking Claude Code for your usage.".into()),
+        Cli::Missing => (
+            p.t.warn,
+            "Claude Code not found",
+            "Usage is read with Claude Code's /usage command. Install Claude Code and sign in with your Claude plan.".into(),
+        ),
+        Cli::NoLimits => (
+            p.t.warn,
+            "No usage limits",
+            "Claude Code isn't signed in with a Pro, Max or Ultra plan (for example it uses an API key), so there are no limits to show.".into(),
+        ),
+        // /usage couldn't be read (Claude Code missing, or its output changed): numbers from the terminal connection, if
+        // there are any, take over.
+        Cli::Failed if c.five_hour_pct.is_some() || c.weekly_pct.is_some() => (
+            p.t.warn,
+            "Using terminal data",
+            "Claude Code's /usage couldn't be read, so these numbers come from the terminal connection and update only during terminal sessions.".into(),
+        ),
+        Cli::Failed => (p.t.bad, "Couldn't read usage", "Claude Code's /usage didn't answer in a way TaskbarHWM understands. Connecting the terminal details below gives a backup.".into()),
+        Cli::Ok => (
+            p.t.ok,
+            "Live",
+            format!(
+                "{} Read from Claude Code's /usage, so chat, the desktop app and the terminal all count.",
+                match age {
+                    Some(a) if a >= 60 => format!("Updated {} ago.", metrics::countdown(a)),
+                    _ => "Updated just now.".to_string(),
+                }
+            ),
+        ),
+    };
+    let extra = 3.0 * p.row_extra;
+    let h = 10.0 + CARD_TITLE_H + 2.0 + 26.0 + 56.0 + 6.0 + rh + 10.0 + extra;
+    p.card(x, y, w, h);
+    let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
+    let ty = y + 10.0;
+    p.text("Usage", &fm.card_title, rect(x0, ty, x1, ty + CARD_TITLE_H), p.t.text);
+    let sy = ty + CARD_TITLE_H + 2.0;
+    p.circle(x0 + 5.0, sy + 12.0, 4.5, tone);
+    p.text(status, &fm.status, rect(x0 + 16.0, sy, x1, sy + 24.0), p.t.text);
+    let dy = sy + 28.0;
+    p.text(&desc, &fm.note, rect(x0, dy, x1, dy + 56.0 + extra), p.t.text_secondary);
+    let ry = dy + 56.0 + 6.0 + extra;
+    p.text("Refresh", &fm.label, rect(x0, ry, x0 + 60.0, ry + rh), p.t.text);
+    let m = cfg.claude_poll_minutes;
+    p.segmented(
+        x1,
+        ry + (rh - 28.0) / 2.0,
+        40.0,
+        &[("1m", m == 1, Action::ClaudePoll(1)), ("2m", m == 2, Action::ClaudePoll(2)), ("5m", m == 5, Action::ClaudePoll(5)), ("10m", m == 10, Action::ClaudePoll(10))],
+    );
+    h
+}
+
+/// The optional status line connection, which adds context use and session cost for terminal sessions.
+fn claude_terminal_card(p: &mut Painter, x: f32, y: f32, w: f32, view: &View) -> f32 {
+    let fm = p.fm;
+    let c = &view.claude;
+    let age = c.updated.map(|u| (crate::sensors::claude::now_secs() - u).max(0));
+    let (tone, status, desc, button): (D2D1_COLOR_F, &str, String, Option<(&str, Action)>) = match (c.link, c.has_data()) {
+        (Link::NoClaudeCode, _) => (
+            p.t.text_secondary,
+            "Claude Code not found",
+            "Adds context and cost for terminal sessions, and a backup source for usage.".into(),
+            None,
+        ),
+        (Link::OtherStatusLine, _) => (
+            p.t.warn,
+            "Another status line is in use",
+            "TaskbarHWM leaves it alone. Remove it from Claude Code's settings.json to add context and cost here.".into(),
+            None,
+        ),
+        (Link::NotConnected, _) => (
+            p.t.text_secondary,
+            "Not connected",
+            "Adds context and cost for terminal sessions, and keeps usage working if Claude changes /usage. Nothing is sent anywhere.".into(),
+            Some(("Connect Claude Code", Action::ClaudeConnect)),
+        ),
+        (Link::Connected, false) => (
+            p.t.warn,
+            "Connected, waiting for a session",
+            "Context and cost appear after a reply in a Claude Code terminal session.".into(),
+            Some(("Disconnect", Action::ClaudeDisconnect)),
+        ),
+        (Link::Connected, true) => (
+            p.t.ok,
+            "Connected",
+            match age {
+                Some(a) if a >= 60 => format!("Last update {} ago, from a Claude Code terminal session.", metrics::countdown(a)),
+                _ => "Last update just now, from a Claude Code terminal session.".to_string(),
+            },
+            Some(("Disconnect", Action::ClaudeDisconnect)),
+        ),
+    };
+    let desc = view.claude_msg.clone().unwrap_or(desc);
+    let extra = 2.0 * p.row_extra;
+    let h = 10.0 + CARD_TITLE_H + 2.0 + 26.0 + 46.0 + if button.is_some() { 38.0 } else { 0.0 } + 10.0 + extra;
+    p.card(x, y, w, h);
+    let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
+    let ty = y + 10.0;
+    p.text("Terminal details", &fm.card_title, rect(x0, ty, x1, ty + CARD_TITLE_H), p.t.text);
+    let sy = ty + CARD_TITLE_H + 2.0;
+    p.circle(x0 + 5.0, sy + 12.0, 4.5, tone);
+    p.text(status, &fm.status, rect(x0 + 16.0, sy, x1, sy + 24.0), p.t.text);
+    let dy = sy + 28.0;
+    p.text(&desc, &fm.note, rect(x0, dy, x1, dy + 46.0), p.t.text_secondary);
+    if let Some((label, action)) = button {
+        p.button(x1, dy + 46.0 + 6.0 + extra, if label == "Disconnect" { 110.0 } else { 160.0 }, label, action);
+    }
+    h
+}
+
+/// Which displays' taskbars show the widget.
+fn displays_card(p: &mut Painter, x: f32, y: f32, w: f32, view: &View) -> f32 {
+    let fm = p.fm;
+    let rh = p.rh();
+    let h = 10.0 + CARD_TITLE_H + 2.0 + (1 + view.displays.len()) as f32 * rh + 30.0 + 10.0;
+    p.card(x, y, w, h);
+    let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
+    let tog_x = x1 - 40.0;
+    let ty = y + 10.0;
+    p.text("Displays", &fm.card_title, rect(x0, ty, x0 + 160.0, ty + CARD_TITLE_H), p.t.text);
+    p.text("Widget", &fm.small, rect(tog_x - 14.0, ty, tog_x + 54.0, ty + CARD_TITLE_H), p.t.text_secondary);
+    let mut ry = ty + CARD_TITLE_H + 2.0;
+
+    p.text("All displays", &fm.label, rect(x0, ry, tog_x - 10.0, ry + rh), p.t.text);
+    p.toggle(tog_x, ry + (rh - 20.0) / 2.0, view.all_displays, Action::DisplayAll(!view.all_displays));
+    ry += rh;
+    // The widget always shows on at least one display: the last one left on is locked.
+    let last_one = view.displays.iter().filter(|d| d.on).count() <= 1;
+    for (i, d) in view.displays.iter().enumerate() {
+        p.text(&d.label, &fm.row_label, rect(x0, ry, tog_x - 10.0, ry + rh), p.t.text);
+        if d.on && last_one {
+            p.toggle_locked(tog_x, ry + (rh - 20.0) / 2.0);
+        } else {
+            p.toggle(tog_x, ry + (rh - 20.0) / 2.0, d.on, Action::DisplayToggle(i));
+        }
+        ry += rh;
+    }
+    let note = if view.displays.len() >= 2 && last_one {
+        "At least one display must stay on."
+    } else if view.displays.len() >= 2 {
+        "Other displays need \u{201C}Show my taskbar on all displays\u{201D} on in Windows."
+    } else {
+        "Connect another display to show the widget on it too."
+    };
+    p.text(note, &fm.note, rect(x0, ry + 2.0, x1, ry + 30.0), p.t.text_secondary);
+    h
+}
+
+/// Version, and shortcuts to the settings file and the project page.
+fn about_card(p: &mut Painter, x: f32, y: f32, w: f32) -> f32 {
+    let fm = p.fm;
+    let rh = p.rh();
+    let h = 10.0 + CARD_TITLE_H + 2.0 + 3.0 * rh + 10.0;
+    p.card(x, y, w, h);
+    let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
+    let ty = y + 10.0;
+    p.text("About", &fm.card_title, rect(x0, ty, x0 + 160.0, ty + CARD_TITLE_H), p.t.text);
+    let mut ry = ty + CARD_TITLE_H + 2.0;
+
+    p.text("Version", &fm.label, rect(x0, ry, x0 + 100.0, ry + rh), p.t.text);
+    p.text(env!("CARGO_PKG_VERSION"), &fm.value, rect(x1 - 100.0, ry, x1, ry + rh), p.t.text);
+    ry += rh;
+
+    p.text("Settings file", &fm.label, rect(x0, ry, x0 + 110.0, ry + rh), p.t.text);
+    p.button(x1, ry + (rh - 28.0) / 2.0, 76.0, "Open", Action::OpenFolder);
+    ry += rh;
+
+    p.text("Source code", &fm.label, rect(x0, ry, x0 + 110.0, ry + rh), p.t.text);
+    p.button(x1, ry + (rh - 28.0) / 2.0, 76.0, "GitHub", Action::OpenUrl);
+    h
+}
+
 /// The PawnIO driver card: an at-a-glance status label, what it's for, and Install when it's missing.
 fn pawn_card(p: &mut Painter, x: f32, y: f32, w: f32, view: &View) -> f32 {
     let fm = p.fm;
@@ -1066,7 +1382,7 @@ fn pawn_card(p: &mut Painter, x: f32, y: f32, w: f32, view: &View) -> f32 {
         }
     });
     let installable = view.pawn == Some(Unavailable::NotInstalled) && matches!(view.setup, SetupState::Idle | SetupState::Failed(_));
-    let h = 10.0 + CARD_TITLE_H + 26.0 + NOTE_H + 4.0 + if installable { 36.0 } else { 0.0 } + 10.0;
+    let h = 10.0 + CARD_TITLE_H + 26.0 + NOTE_H + 4.0 + if installable { 36.0 } else { 0.0 } + 10.0 + 3.0 * p.row_extra;
     p.card(x, y, w, h);
     let (x0, x1) = (x + CARD_PAD, x + w - CARD_PAD);
     let ty = y + 10.0;
@@ -1140,86 +1456,127 @@ fn layout_card(p: &mut Painter, x: f32, y: f32, w: f32, cfg: &Config) -> f32 {
     h
 }
 
-/// Draws the three settings columns with `extra[i]` more height per row in column `i`. Returns each column's height
-/// (including the gap below its last card).
-///
-/// 1. Processor side: CPU, the disks, and the driver the CPU's temperature and power depend on.
-/// 2. Graphics and memory.
-/// 3. Network and its adapters, then general options.
-fn settings_columns(p: &mut Painter, cfg: &Config, view: &View, col_w: f32, extra: [f32; 3]) -> [f32; 3] {
-    let xs = [PAD, 2.0 * PAD + col_w, 3.0 * PAD + 2.0 * col_w];
-    let (mut c1, mut c2, mut c3) = (0.0, 0.0, 0.0);
-
-    p.row_extra = extra[0];
-    c1 += metrics_card(p, xs[0], c1, col_w, "CPU", Section::Cpu, cfg) + CARD_GAP;
-    c1 += disks_card(p, xs[0], c1, col_w, cfg, view) + CARD_GAP;
-    c1 += pawn_card(p, xs[0], c1, col_w, view) + CARD_GAP;
-
-    p.row_extra = extra[1];
-    if view.gpus.len() >= 2 {
-        c2 += gpus_card(p, xs[1], c2, col_w, view) + CARD_GAP;
+/// The cards of one settings page, in up to two columns (Appearance has one wide column). `extra[i]` is the extra height
+/// added to every row of column `i`. Returns the column heights, without the gap below the last card.
+fn page_columns(p: &mut Painter, cfg: &Config, view: &View, tab: Tab, extra: [f32; 2]) -> [f32; 2] {
+    let xs = [CONTENT_X, CONTENT_X + COL_W + PAD];
+    let wide = 2.0 * COL_W + PAD;
+    let mut h = [0.0f32; 2];
+    for i in 0..2 {
+        p.row_extra = extra[i];
+        let (x, y) = (xs[i], &mut h[i]);
+        match (tab, i) {
+            (Tab::General, 0) => {
+                *y += general_card(p, x, *y, COL_W, cfg, view) + CARD_GAP;
+                *y += about_card(p, x, *y, COL_W) + CARD_GAP;
+            }
+            (Tab::General, _) => *y += displays_card(p, x, *y, COL_W, view) + CARD_GAP,
+            (Tab::Appearance, 0) => {
+                *y += layout_card(p, x, *y, wide, cfg) + CARD_GAP;
+                *y += customization_card(p, x, *y, wide, cfg) + CARD_GAP;
+            }
+            (Tab::Cpu, 0) => *y += metrics_card(p, x, *y, COL_W, "CPU", &view.cpu_name, Section::Cpu, cfg) + CARD_GAP,
+            (Tab::Cpu, _) => *y += pawn_card(p, x, *y, COL_W, view) + CARD_GAP,
+            (Tab::Gpu, 0) => {
+                // One card: name it here. With several, the Graphics cards card beside this one lists them.
+                let name = if view.gpus.len() == 1 { view.gpus[0].name.as_str() } else { "" };
+                *y += metrics_card(p, x, *y, COL_W, "GPU", name, Section::Gpu, cfg) + CARD_GAP;
+            }
+            (Tab::Gpu, _) => {
+                if view.gpus.len() >= 2 {
+                    *y += gpus_card(p, x, *y, COL_W, view) + CARD_GAP;
+                }
+            }
+            (Tab::Memory, 0) => {
+                let total = view.ram_total.map(|b| format!("{:.1} GB total", b as f64 / (1024.0 * 1024.0 * 1024.0))).unwrap_or_default();
+                *y += metrics_card(p, x, *y, COL_W, "Memory", &total, Section::Ram, cfg) + CARD_GAP;
+            }
+            (Tab::Disks, 0) => *y += disks_card(p, x, *y, COL_W, cfg, view) + CARD_GAP,
+            (Tab::Network, 0) => {
+                let up: Vec<&str> = view.adapters.iter().filter(|a| a.connected).map(|a| a.name.as_str()).collect();
+                let name = if view.adapters.is_empty() { String::new() } else if up.is_empty() { "Not connected".to_string() } else { up.join(", ") };
+                *y += network_card(p, x, *y, COL_W, &name, cfg) + CARD_GAP;
+            }
+            (Tab::Network, _) => {
+                if view.adapters.len() >= 2 {
+                    *y += adapters_card(p, x, *y, COL_W, view) + CARD_GAP;
+                }
+            }
+            (Tab::Claude, 0) => *y += metrics_card(p, x, *y, COL_W, "Claude", "", Section::Claude, cfg) + CARD_GAP,
+            (Tab::Claude, _) => {
+                *y += claude_usage_card(p, x, *y, COL_W, cfg, view) + CARD_GAP;
+                *y += claude_terminal_card(p, x, *y, COL_W, view) + CARD_GAP;
+            }
+            _ => {}
+        }
     }
-    c2 += metrics_card(p, xs[1], c2, col_w, "GPU", Section::Gpu, cfg) + CARD_GAP;
-    c2 += metrics_card(p, xs[1], c2, col_w, "Memory", Section::Ram, cfg) + CARD_GAP;
-
-    p.row_extra = extra[2];
-    c3 += network_card(p, xs[2], c3, col_w, cfg) + CARD_GAP;
-    if view.adapters.len() >= 2 {
-        c3 += adapters_card(p, xs[2], c3, col_w, view) + CARD_GAP;
-    }
-    c3 += general_card(p, xs[2], c3, col_w, cfg, view) + CARD_GAP;
     p.row_extra = 0.0;
-    [c1, c2, c3]
+    for v in &mut h {
+        if *v > 0.0 {
+            *v -= CARD_GAP;
+        }
+    }
+    h
 }
 
-/// Settings page body: three columns so it stays short, with related cards kept together. Along the bottom: the
-/// widget's layout (two columns wide) and the look of its labels. Every column, and both bottom cards, end flush:
-/// the shorter ones get a little more height per row instead of leaving a gap. Returns the content height.
-fn settings_body(p: &mut Painter, cfg: &Config, view: &View) -> f32 {
-    let col_w = (p.width - 4.0 * PAD) / 3.0;
-    let wide = 2.0 * col_w + PAD;
-    let xs = [PAD, 2.0 * PAD + col_w, 3.0 * PAD + 2.0 * col_w];
-
-    // Each column's height grows by one pixel per row for every pixel of row_extra, so two dry runs give its height
-    // and its row count.
-    let measure = |p: &Painter, extra: f32| {
-        let mut m = Painter::new(None, p.t, p.fm, p.dw, None, None, 0.0, f32::MAX, p.width);
-        m.in_body = true;
-        settings_columns(&mut m, cfg, view, col_w, [extra; 3])
-    };
-    let (h0, h1) = (measure(p, 0.0), measure(p, 1.0));
-    // All rows start a little taller than the base; the shorter columns are stretched up to the tallest.
-    let base = 2.0;
-    let target = (0..3).map(|i| h0[i] + (h1[i] - h0[i]) * base).fold(0.0, f32::max);
-    let mut extra = [0.0; 3];
-    for i in 0..3 {
-        let rows = (h1[i] - h0[i]).max(1.0);
-        extra[i] = (target - h0[i]) / rows;
+/// The navigation column: General and Appearance, then the metrics. Returns its height.
+fn nav(p: &mut Painter, tab: Tab) -> f32 {
+    let fm = p.fm;
+    let x = PAD;
+    let mut y = 0.0;
+    for t in [Tab::General, Tab::Appearance] {
+        p.nav_item(x, y, t, t == tab);
+        y += NAV_ITEM_H + 2.0;
     }
-    let top = settings_columns(p, cfg, view, col_w, extra).into_iter().fold(0.0, f32::max);
+    y += 8.0;
+    p.text("Metrics", &fm.row_label, rect(x + 12.0, y, x + NAV_W, y + 22.0), p.t.text_secondary);
+    y += 24.0;
+    for t in Tab::METRICS {
+        p.nav_item(x, y, t, t == tab);
+        y += NAV_ITEM_H + 2.0;
+    }
+    y - 2.0
+}
 
-    // Bottom row: same idea for the two cards.
-    let bottom = |p: &mut Painter, e: [f32; 2], draw: bool| -> [f32; 2] {
-        let mut m;
-        let q: &mut Painter = if draw {
-            p
-        } else {
-            m = Painter::new(None, p.t, p.fm, p.dw, None, None, 0.0, f32::MAX, p.width);
-            m.in_body = true;
-            &mut m
-        };
-        q.row_extra = e[0];
-        let a = layout_card(q, xs[0], top, wide, cfg);
-        q.row_extra = e[1];
-        let b = customization_card(q, xs[2], top, col_w, cfg);
-        q.row_extra = 0.0;
-        [a, b]
-    };
-    let (b0, b1) = (bottom(p, [0.0; 2], false), bottom(p, [1.0; 2], false));
-    let btarget = b0[0].max(b0[1]);
-    let be = [0, 1].map(|i| (btarget - b0[i]) / (b1[i] - b0[i]).max(1.0));
-    let hb = bottom(p, be, true);
-    top + hb[0].max(hb[1]) + PAD
+/// A painter that measures without drawing, with the same fonts and width as `p`.
+fn dry_painter<'a>(p: &Painter<'a>) -> Painter<'a> {
+    let mut m = Painter::new(None, p.t, p.fm, p.dw, None, None, 0.0, f32::MAX, p.width);
+    m.in_body = true;
+    m
+}
+
+/// The most a stretched row may grow, so a short column never ends up with oddly tall rows.
+const MAX_ROW_EXTRA: f32 = 12.0;
+
+/// The height every settings page has: the tallest page (or the navigation column), so the window never changes
+/// size when you move between pages.
+fn settings_target(p: &Painter, cfg: &Config, view: &View) -> f32 {
+    let mut m = dry_painter(p);
+    let mut target = nav(&mut m, Tab::General);
+    for tab in Tab::ALL {
+        let h = page_columns(&mut m, cfg, view, tab, [0.0; 2]);
+        target = target.max(h[0]).max(h[1]);
+    }
+    target
+}
+
+/// The settings window's body: the navigation column and the open page. Shorter pages stretch their rows a little
+/// so their columns end where the tallest page ends. Returns the content height (the same on every page).
+fn settings_body(p: &mut Painter, cfg: &Config, view: &View, tab: Tab) -> f32 {
+    let target = settings_target(p, cfg, view);
+    nav(p, tab);
+    // A column's height grows by one pixel per row for every pixel of extra, so two dry runs give its row count.
+    let measure = |p: &Painter, extra: f32| page_columns(&mut dry_painter(p), cfg, view, tab, [extra; 2]);
+    let (h0, h1) = (measure(p, 0.0), measure(p, 1.0));
+    let mut extra = [0.0; 2];
+    for i in 0..2 {
+        let rows = h1[i] - h0[i];
+        if rows >= 1.0 && h0[i] > 0.0 {
+            extra[i] = ((target - h0[i]) / rows).clamp(0.0, MAX_ROW_EXTRA);
+        }
+    }
+    page_columns(p, cfg, view, tab, extra);
+    target + PAD
 }
 
 /// Things the settings page needs besides the config.
@@ -1237,8 +1594,20 @@ struct AdapterInfo {
     included: bool,
 }
 
+/// A display as the settings page needs it.
+struct DisplayInfo {
+    label: String,
+    on: bool,
+}
+
 struct View {
+    claude: ClaudeStats,
+    claude_msg: Option<String>,
+    cpu_name: String,
+    ram_total: Option<u64>,
     gpus: Vec<GpuInfo>,
+    displays: Vec<DisplayInfo>,
+    all_displays: bool,
     adapters: Vec<AdapterInfo>,
     disks: Vec<DiskStats>,
     autostart: bool,
@@ -1266,8 +1635,21 @@ impl Fly {
             .iter()
             .map(|a| AdapterInfo { name: a.name.clone(), connected: a.connected, included: counted.contains(&a.name.as_str()) })
             .collect();
+        let all = displays::list();
+        let chosen = displays::selected(&cfg.widget_displays, &all);
+        let display_rows = all.iter().map(|d| DisplayInfo { label: d.label.clone(), on: chosen.iter().any(|c| c.key == d.key) }).collect();
+        let mut claude = self.snap.claude.clone();
+        if let Some(l) = self.claude_link {
+            claude.link = l;
+        }
         let mut v = View {
+            claude,
+            claude_msg: self.claude_msg.clone(),
+            cpu_name: self.cpu_name.clone(),
+            ram_total: self.snap.ram.map(|r| r.total_bytes),
             gpus,
+            displays: display_rows,
+            all_displays: cfg.widget_displays.iter().any(|k| k == displays::ALL),
             adapters,
             disks: self.snap.disks.clone(),
             autostart: self.autostart,
@@ -1318,7 +1700,7 @@ impl Fly {
         p.in_body = true;
         match self.page {
             Page::Dashboard => dashboard_body(&mut p, cards),
-            Page::Settings => settings_body(&mut p, cfg, &self.view()),
+            Page::Settings => settings_body(&mut p, cfg, &self.view(), self.tab),
         }
     }
 
@@ -1340,7 +1722,7 @@ impl Fly {
             self.apply_pos();
         }
 
-        let (t, fm, mouse, scroll, page, max_scroll) = (self.theme, &self.fmts, self.mouse, self.scroll, self.page, self.max_scroll);
+        let (t, fm, mouse, scroll, page, max_scroll, tab) = (self.theme, &self.fmts, self.mouse, self.scroll, self.page, self.max_scroll, self.tab);
         let (dw, drag) = (&self.dwrite, self.drag);
         let view = self.view();
         let mut hits = Vec::new();
@@ -1351,7 +1733,7 @@ impl Fly {
             p.begin_body();
             match page {
                 Page::Dashboard => dashboard_body(&mut p, &cards),
-                Page::Settings => settings_body(&mut p, &cfg, &view),
+                Page::Settings => settings_body(&mut p, &cfg, &view, tab),
             };
             p.end_body();
             if max_scroll > 0.0 {
@@ -1495,6 +1877,59 @@ impl Fly {
                 self.page = Page::Dashboard;
                 self.scroll = 0.0;
             }
+            Action::Tab(t) => {
+                self.tab = t;
+                self.scroll = 0.0;
+            }
+            Action::OpenTab(t) => {
+                self.page = Page::Settings;
+                self.tab = t;
+                self.scroll = 0.0;
+            }
+            Action::ClaudePoll(m) => cfg.claude_poll_minutes = m,
+            Action::ClaudeConnect => match claude_setup::connect() {
+                Ok(()) => {
+                    self.claude_msg = None;
+                    self.claude_link = Some(Link::Connected);
+                }
+                Err(e) => self.claude_msg = Some(e),
+            },
+            Action::ClaudeDisconnect => match claude_setup::disconnect() {
+                Ok(()) => {
+                    self.claude_msg = None;
+                    self.claude_link = Some(Link::NotConnected);
+                }
+                Err(e) => self.claude_msg = Some(e),
+            },
+            Action::DisplayAll(on) => {
+                cfg.widget_displays = if on {
+                    vec![displays::ALL.to_string()]
+                } else {
+                    displays::selected(&cfg.widget_displays, &displays::list()).iter().map(|d| d.key.clone()).collect()
+                };
+            }
+            Action::DisplayToggle(i) => {
+                let all = displays::list();
+                if let Some(key) = all.get(i).map(|d| d.key.clone()) {
+                    // Start from where the widget shows now, then flip this display; at least one always stays on.
+                    let mut sel: Vec<String> = displays::selected(&cfg.widget_displays, &all).iter().map(|d| d.key.clone()).collect();
+                    match sel.iter().position(|k| *k == key) {
+                        Some(pos) if sel.len() > 1 => {
+                            sel.remove(pos);
+                        }
+                        Some(_) => {}
+                        None => sel.push(key),
+                    }
+                    // Every display on again is "all", which also covers displays plugged in later.
+                    cfg.widget_displays = if sel.len() == all.len() { vec![displays::ALL.to_string()] } else { sel };
+                }
+            }
+            Action::OpenFolder => {
+                if let Some(appdata) = std::env::var_os("APPDATA") {
+                    open_with_shell(&std::path::PathBuf::from(appdata).join("TaskbarHWM").to_string_lossy());
+                }
+            }
+            Action::OpenUrl => open_with_shell("https://github.com/joeabouserhal/TaskbarHWM"),
             Action::Toggle(id, target) => {
                 let list = match target {
                     Target::Flyout => &mut cfg.flyout,
@@ -1531,7 +1966,7 @@ impl Fly {
                 super::backdrop::apply(self.hwnd, self.theme.dark, t);
             }
         }
-        if !matches!(a, Action::Chip(..) | Action::OpenSettings | Action::Back | Action::Autostart(_) | Action::InstallPawn) {
+        if !matches!(a, Action::Chip(..) | Action::OpenSettings | Action::Back | Action::Tab(_) | Action::OpenTab(_) | Action::ClaudeConnect | Action::ClaudeDisconnect | Action::OpenFolder | Action::OpenUrl | Action::Autostart(_) | Action::InstallPawn) {
             config::set(cfg);
             unsafe {
                 let _ = PostMessageW(Some(self.widget), WM_CONFIG, WPARAM(0), LPARAM(0));

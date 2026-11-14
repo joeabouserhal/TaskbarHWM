@@ -16,12 +16,19 @@ service. The app is under 1 MB on disk and typically uses 10 to 30 MB of memory.
 | Memory | usage, used / total |
 | Disks | every local drive: used / total, % used or free space, as one combined row or one row per drive |
 | Network | download and upload speed, as one row or split into two. Count all adapters as a total, or only the ones you pick; show MB/s or Mbps |
+| Claude | your Claude 5-hour and weekly usage and when each resets, read with Claude Code's `/usage` (see [Claude usage](#claude-usage)); optionally the latest terminal session's context use and cost |
 
-Everything is optional. For each reading you choose whether it appears on the taskbar, in the flyout, or both.
+Everything is optional. Settings has a navigation column with **General**, **Appearance**, and a **Metrics** group
+with one page each for CPU, GPU, Memory, Disks, Network and Claude. On each metrics page you choose, for every
+reading, whether it appears on the taskbar, in the flyout, or both.
 The widget's rows and columns can be reordered by dragging, and text size, spacing, labels (icon, text or both),
 badges and flyout transparency are adjustable.
 
 Units ("GHz", "%", "GB") are drawn smaller and muted so the number stands out.
+
+With several displays, **Settings > General > Displays** lets you show the widget on the taskbar of the main
+display only (the default), on any displays you pick, or on all of them, including ones you connect later.
+Other displays need Windows' *Show my taskbar on all displays* setting turned on, since the widget sits on a taskbar.
 
 ## Requirements
 
@@ -62,6 +69,7 @@ and power works without it.
 | Start-with-Windows entry (optional) | A Task Scheduler task named `TaskbarHWM`, set to run at sign-in with highest privileges | A scheduled task rather than a Run key, so there is no UAC prompt at sign-in |
 | Your settings | `%APPDATA%\TaskbarHWM\config.toml` | Created on first run. If the file is ever unreadable it is kept as `config.toml.bad` before defaults are used |
 | Crash report | `%LOCALAPPDATA%\TaskbarHWM\crash.log` | Only written if the app crashes |
+| Claude relay (only if you click *Connect Claude Code*) | `%LOCALAPPDATA%\TaskbarHWM\claude-relay.ps1` and `claude-status.txt`; one `statusLine` entry in `%USERPROFILE%\.claude\settings.json`, with the original kept as `settings.json.taskbarhwm-backup` | See [Claude usage](#claude-usage). *Disconnect* (or uninstalling) removes the entry, the script and the saved numbers |
 
 About PawnIO: it is a small, signed, open-source driver that lets programs read CPU model-specific registers
 safely. TaskbarHWM uses it for CPU temperature and power on AMD (Zen) and Intel CPUs. The installer downloads
@@ -89,10 +97,45 @@ The PawnIO modules the app needs (`AMDFamily17.bin`, `IntelMSR.bin`) are compile
 Integrated AMD GPUs do not report their own power (the driver gives whole-chip power), so it is left blank
 rather than shown wrongly.
 
+## Claude usage
+
+The Claude section shows your **5-hour** and **weekly** usage limits and when each resets, and the weekly limit of one
+model if your plan has one. It works wherever you use Claude: chat, the desktop app, and Claude Code in a terminal,
+because the limits belong to your account.
+
+It needs **Claude Code installed and signed in with your Claude plan** (Pro, Max or Ultra); the desktop app alone isn't
+enough. Every minute or two (you choose, in **Settings > Claude > Usage > Refresh**) TaskbarHWM runs Claude Code's
+built-in `/usage` command headlessly (`claude -p "/usage"`) and reads the result. That command makes no model request,
+so it **costs nothing against your limits and can't start a limit window**. TaskbarHWM never reads your login or token
+and doesn't contact Anthropic itself: the `claude` you installed does its own talking. It only polls while at least
+one Claude reading is switched on, and also refreshes when you open the flyout.
+
+The call is trimmed to start fast and touch nothing else: no connectors, no user settings or hooks, no tools, no saved
+session. It keeps `claude-empty-mcp.json` in `%LOCALAPPDATA%\TaskbarHWM` for that.
+
+If you use an API key instead of a plan, Claude Code has no limits to report, and the page says so.
+
+### Optional: context use and session cost
+
+`/usage` doesn't include per-session details. If you also run Claude Code in a terminal, **Settings > Claude > Terminal
+details > Connect Claude Code** adds those two readings through Claude Code's documented **status line** feature. It
+runs a small PowerShell script, which has to be PowerShell because TaskbarHWM runs elevated and Claude Code launching
+it would trigger an administrator prompt. The script:
+
+1. is saved as `claude-relay.ps1` in `%LOCALAPPDATA%\TaskbarHWM`; it reads the JSON Claude Code hands it, keeps a few
+   numbers in `claude-status.txt` next to itself, and prints nothing (so your status line stays as it is);
+2. is registered by one `statusLine` entry in `%USERPROFILE%\.claude\settings.json`, after saving
+   `settings.json.taskbarhwm-backup`; everything else in that file is left untouched.
+
+**Disconnect** removes the entry again. If Claude Code already has a status line of its own, TaskbarHWM leaves it alone
+and says so. Only terminal sessions run the status line (the desktop app and chat don't), and context use and cost
+are per session: the widget shows the one that reported last.
+
 ## Uninstalling
 
 Use *Apps > Installed apps*, or the uninstaller in the install folder. It closes the app, removes the files, the
-shortcut and the scheduled task, and asks whether to delete your settings. **PawnIO is left installed** because
+shortcut and the scheduled task, takes TaskbarHWM out of Claude Code's status line if you had connected it, and asks
+whether to delete your settings. **PawnIO is left installed** because
 other programs may use it; remove it separately from *Apps > Installed apps* if you want it gone.
 
 ## Building
@@ -126,7 +169,7 @@ powershell -File scripts\build-installer.ps1
 
 Builds the app, then compiles `installer\TaskbarHWM.iss`.
 
-Silent install for scripts: `TaskbarHWM-Setup-0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
+Silent install for scripts: `TaskbarHWM-Setup-0.1.1.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
 (add `/TASKS="!autostart"` to skip autostart). `/DRYRUNPAWNIO` pretends PawnIO is missing and only downloads and
 verifies its installer, which is useful for testing.
 
@@ -138,11 +181,14 @@ To get an unelevated *release* build for automated tests, set `TASKBARHWM_ASINVO
 ```
 TaskbarHWM.exe --dump [file]        print a few seconds of sensor readings (CPUs, GPUs, memory, network)
 TaskbarHWM.exe --autostart on|off   create or remove the sign-in task
+TaskbarHWM.exe --claude on|off      connect or disconnect Claude Code's status line (what the Claude page's button does)
 TaskbarHWM.exe --verify-installer   check the PawnIO download and hash steps without running the installer
 cargo test                          unit tests (sensor decoding, value formatting, network totals)
 ```
 
-Environment switches for development: `HWM_KEEP_OPEN=1` keeps the flyout open when it loses focus;
+Environment switches for development: `HWM_CLAUDE_DIR` and `HWM_DATA_DIR` point the Claude connection at scratch
+folders instead of your real `.claude` and `%LOCALAPPDATA%\TaskbarHWM` (the tests do this); `HWM_KEEP_OPEN=1` keeps
+the flyout open when it loses focus;
 `HWM_FAKE_PAWN=active|missing|restart|failed` previews the PawnIO card's states.
 
 Source layout: `src\sensors` (CPU, GPU, memory, disk, network samplers), `src\metrics.rs` (the catalogue of

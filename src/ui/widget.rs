@@ -1,7 +1,7 @@
 //! The taskbar widget: a transparent topmost window drawn over the far-left of the taskbar.
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ use super::gfx::{Gfx, Surface};
 use super::theme::Theme;
 use crate::config::Config;
 use crate::metrics;
+use crate::shell::displays;
 use crate::sensors::{Sampler, Snapshot};
 
 const WM_SNAPSHOT: u32 = WM_APP + 1;
@@ -83,10 +84,54 @@ struct Block {
     width: f32,
 }
 
+/// One widget window: the widget as drawn over the taskbar of one display.
+struct Win {
+    hwnd: HWND,
+    surface: Surface,
+    /// Top-left of the window on screen, in pixels (the taskbar's top-left).
+    pos: (i32, i32),
+    hover: bool,
+    pressed: bool,
+    /// The display it is on (`displays::Display::key`).
+    monitor: String,
+    /// The taskbar window it sits over.
+    tray: HWND,
+}
+
+impl Win {
+    fn create(gfx: &Gfx, monitor: String, tray: HWND) -> Option<Win> {
+        unsafe {
+            let hinst = GetModuleHandleW(None).ok()?;
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                w!("TaskbarHWM.Widget"),
+                w!("TaskbarHWM"),
+                WS_POPUP,
+                0,
+                0,
+                200,
+                48,
+                None,
+                None,
+                Some(hinst.into()),
+                None,
+            )
+            .ok()?;
+            let Ok(surface) = Surface::new(gfx, 200, 48, 96.0) else {
+                let _ = DestroyWindow(hwnd);
+                return None;
+            };
+            Some(Win { hwnd, surface, pos: (0, 0), hover: false, pressed: false, monitor, tray })
+        }
+    }
+}
+
 struct App {
     gfx: Gfx,
-    surface: Surface,
-    hwnd: HWND,
+    /// A hidden window that owns the timer and receives the app's own messages (new readings, setting changes, the
+    /// settings page's requests). The visible widget windows come and go with the chosen displays; this one stays.
+    controller: HWND,
+    wins: Vec<Win>,
     cfg: Config,
     shared: Arc<Mutex<Snapshot>>,
     snap: Snapshot,
@@ -105,9 +150,6 @@ struct App {
     label_dy: f32,
     blocks: Vec<Block>,
     width_dip: f32,
-    pos: (i32, i32),
-    hover: bool,
-    pressed: bool,
     hidden_fullscreen: bool,
     first_run_checked: bool,
 }
@@ -337,59 +379,67 @@ impl App {
         self.width_dip
     }
 
-    /// Positions the window over the left end of the taskbar and resizes the bitmap to match.
-    fn place(&mut self) {
-        unsafe {
-            if self.hidden_fullscreen {
-                let _ = ShowWindow(self.hwnd, SW_HIDE);
-                return;
-            }
-            let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) else { return };
-            let mut r = RECT::default();
-            if GetWindowRect(tray, &mut r).is_err() {
-                return;
-            }
-            let (tw, th) = (r.right - r.left, r.bottom - r.top);
-            if tw < th {
-                // Vertical taskbars aren't supported yet.
-                let _ = ShowWindow(self.hwnd, SW_HIDE);
-                return;
-            }
-            let dpi = GetDpiForWindow(tray).max(96) as f32;
-            let scale = dpi / 96.0;
-            let w_px = ((self.width_dip + EDGE) * scale).ceil() as i32;
-            self.pos = (r.left, r.top);
-            let _ = self.surface.resize(w_px as u32, th as u32, dpi);
-            // Size and position are applied by UpdateLayeredWindow in render(); the rest keeps us shown and on top.
-            //
-            // The taskbar owns us: Windows keeps an owned window directly above its owner, so when the taskbar
-            // raises itself (a right-click on it, an app opening from it) we are raised in the same step instead of
-            // staying hidden until the next tick. It also means we never have to push ourselves above other
-            // topmost windows, such as menus and jump lists, just to be seen.
-            if GetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT) != tray.0 as isize {
-                SetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT, tray.0 as isize);
-            }
-            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
-            if !IsWindowVisible(self.hwnd).as_bool() || (!MENU_OPEN.load(Ordering::Relaxed) && is_below(self.hwnd, tray)) {
-                // Only when the taskbar has actually ended up above us (and no menu of ours is open): never over a menu.
-                let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+    /// Makes sure there is one widget window over the taskbar of every display the user chose, and none elsewhere.
+    fn sync_windows(&mut self) {
+        let all = displays::list();
+        let trays = displays::trays();
+        let desired: Vec<(String, HWND)> = displays::selected(&self.cfg.widget_displays, &all)
+            .into_iter()
+            .filter_map(|d| trays.iter().find(|(_, key)| *key == d.key).map(|(tray, _)| (d.key.clone(), *tray)))
+            .collect();
+        // Drop windows that were destroyed (Explorer restarting takes its taskbar's windows with it) or are no longer wanted.
+        let mut i = 0;
+        while i < self.wins.len() {
+            let alive = unsafe { IsWindow(Some(self.wins[i].hwnd)).as_bool() };
+            if alive && desired.iter().any(|(key, _)| *key == self.wins[i].monitor) {
+                i += 1;
             } else {
-                let _ = SetWindowPos(self.hwnd, None, 0, 0, 0, 0, flags | SWP_NOZORDER);
+                let w = self.wins.remove(i);
+                if alive {
+                    unsafe {
+                        let _ = DestroyWindow(w.hwnd);
+                    }
+                }
+            }
+        }
+        for (key, tray) in desired {
+            match self.wins.iter_mut().find(|w| w.monitor == key) {
+                Some(w) => w.tray = tray,
+                None => {
+                    if let Some(w) = Win::create(&self.gfx, key, tray) {
+                        self.wins.push(w);
+                    }
+                }
             }
         }
     }
 
-    fn render(&mut self) {
+    fn place_all(&mut self) {
+        let (width_dip, hidden) = (self.width_dip, self.hidden_fullscreen);
+        for w in &mut self.wins {
+            place_win(w, width_dip, hidden);
+        }
+    }
+
+    fn render(&self) {
+        for i in 0..self.wins.len() {
+            self.render_win(i);
+        }
+    }
+
+    /// Draws the widget into window `idx`.
+    fn render_win(&self, idx: usize) {
+        let w = &self.wins[idx];
         let t = self.theme;
-        let (hover, pressed) = (self.hover, self.pressed);
-        let w_dip = self.surface.width as f32 * 96.0 / self.surface.dpi;
-        let h_dip = self.surface.height as f32 * 96.0 / self.surface.dpi;
+        let (hover, pressed) = (w.hover, w.pressed);
+        let w_dip = w.surface.width as f32 * 96.0 / w.surface.dpi;
+        let h_dip = w.surface.height as f32 * 96.0 / w.surface.dpi;
         let blocks = &self.blocks;
         let (row_h, col_gap, label_gap, block_gap) = (self.row_h(), self.col_gap(), self.label_gap(), self.block_gap());
         let isz = self.icon_size();
         let (val_dy, label_dy, unit_dy) = (self.val_dy, self.label_dy, self.unit_dy);
-        let (px, py) = self.pos;
-        let _ = self.surface.present(self.hwnd, px, py, |dc| unsafe {
+        let (px, py) = w.pos;
+        let _ = w.surface.present(w.hwnd, px, py, |dc| unsafe {
             let Ok(text) = dc.CreateSolidColorBrush(&t.text, None) else { return };
             let Ok(dim) = dc.CreateSolidColorBrush(&t.text_secondary, None) else { return };
             let Ok(badge_fill) = dc.CreateSolidColorBrush(&t.badge_fill, None) else { return };
@@ -458,13 +508,19 @@ impl App {
         });
     }
 
-    fn open_flyout(&self, settings: bool) {
-        let scale = self.surface.dpi / 96.0;
+    /// The window to anchor the flyout to: the one clicked, or the first.
+    fn win_for(&self, from: Option<HWND>) -> Option<&Win> {
+        from.and_then(|h| self.wins.iter().find(|w| w.hwnd == h)).or_else(|| self.wins.first())
+    }
+
+    fn open_flyout(&self, settings: bool, from: Option<HWND>) {
+        let Some(w) = self.win_for(from) else { return };
+        let scale = w.surface.dpi / 96.0;
         super::flyout::toggle(super::flyout::OpenParams {
-            anchor_x: self.pos.0 + (EDGE * scale) as i32,
-            taskbar_top: self.pos.1,
+            anchor_x: w.pos.0 + (EDGE * scale) as i32,
+            taskbar_top: w.pos.1,
             scale,
-            widget: self.hwnd,
+            widget: self.controller,
             snap: &self.snap,
             theme: self.theme,
             dwrite: &self.gfx.dwrite,
@@ -473,13 +529,14 @@ impl App {
     }
 
     /// Opens the settings page, whether or not the flyout is already open.
-    fn open_settings(&self) {
-        let scale = self.surface.dpi / 96.0;
+    fn open_settings(&self, from: Option<HWND>) {
+        let Some(w) = self.win_for(from) else { return };
+        let scale = w.surface.dpi / 96.0;
         super::flyout::show_settings(super::flyout::OpenParams {
-            anchor_x: self.pos.0 + (EDGE * scale) as i32,
-            taskbar_top: self.pos.1,
+            anchor_x: w.pos.0 + (EDGE * scale) as i32,
+            taskbar_top: w.pos.1,
             scale,
-            widget: self.hwnd,
+            widget: self.controller,
             snap: &self.snap,
             theme: self.theme,
             dwrite: &self.gfx.dwrite,
@@ -500,13 +557,13 @@ impl App {
                 c.setup_shown = true;
                 crate::config::set(c);
                 self.cfg = crate::config::get();
-                self.open_flyout(true);
+                self.open_flyout(true, None);
             }
         }
         let before = self.width_dip;
         self.rebuild();
         if (self.width_dip - before).abs() > 0.5 {
-            self.place();
+            self.place_all();
         }
         self.render();
     }
@@ -516,10 +573,53 @@ impl App {
         let fullscreen = matches!(state, Ok(s) if s == QUNS_BUSY || s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE);
         self.hidden_fullscreen = fullscreen;
         self.theme = Theme::current();
-        // Re-asserting position also keeps us above the taskbar, which re-raises itself when clicked.
-        self.place();
+        // Displays and taskbars come and go; re-asserting position also keeps us above a taskbar that re-raises itself.
+        self.sync_windows();
+        self.place_all();
         if !fullscreen {
             self.render();
+        }
+    }
+}
+
+/// Positions a widget window over the left end of its taskbar and resizes its bitmap to match.
+fn place_win(w: &mut Win, width_dip: f32, hidden: bool) {
+    unsafe {
+        if hidden {
+            let _ = ShowWindow(w.hwnd, SW_HIDE);
+            return;
+        }
+        let tray = w.tray;
+        let mut r = RECT::default();
+        if GetWindowRect(tray, &mut r).is_err() {
+            return;
+        }
+        let (tw, th) = (r.right - r.left, r.bottom - r.top);
+        if tw < th {
+            // Vertical taskbars aren't supported yet.
+            let _ = ShowWindow(w.hwnd, SW_HIDE);
+            return;
+        }
+        let dpi = GetDpiForWindow(tray).max(96) as f32;
+        let scale = dpi / 96.0;
+        let w_px = ((width_dip + EDGE) * scale).ceil() as i32;
+        w.pos = (r.left, r.top);
+        let _ = w.surface.resize(w_px as u32, th as u32, dpi);
+        // Size and position are applied by UpdateLayeredWindow when drawing; the rest keeps us shown and on top.
+        //
+        // The taskbar owns us: Windows keeps an owned window directly above its owner, so when the taskbar
+        // raises itself (a right-click on it, an app opening from it) we are raised in the same step instead of
+        // staying hidden until the next tick. It also means we never have to push ourselves above other
+        // topmost windows, such as menus and jump lists, just to be seen.
+        if GetWindowLongPtrW(w.hwnd, GWLP_HWNDPARENT) != tray.0 as isize {
+            SetWindowLongPtrW(w.hwnd, GWLP_HWNDPARENT, tray.0 as isize);
+        }
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+        if !IsWindowVisible(w.hwnd).as_bool() || (!MENU_OPEN.load(Ordering::Relaxed) && is_below(w.hwnd, tray)) {
+            // Only when the taskbar has actually ended up above us (and no menu of ours is open): never over a menu.
+            let _ = SetWindowPos(w.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+        } else {
+            let _ = SetWindowPos(w.hwnd, None, 0, 0, 0, 0, flags | SWP_NOZORDER);
         }
     }
 }
@@ -567,6 +667,20 @@ fn allow_dark_menus() {
     });
 }
 
+/// Ends the process right away.
+///
+/// Returning from `main` makes Windows run its normal process shutdown, which crashed every time (exit code
+/// 0xC000000D from inside ntdll) while the libraries this app loads (the GPU vendors' DLLs and the PawnIO helper) were
+/// being detached. Nothing here needs an orderly shutdown: settings are saved as they change and the windows go away
+/// with the process, so it simply terminates itself.
+fn quit_now() -> ! {
+    use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    unsafe {
+        let _ = TerminateProcess(GetCurrentProcess(), 0);
+    }
+    std::process::exit(0)
+}
+
 /// True while the right-click menu is on screen, so the widget doesn't re-raise itself over it.
 static MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -608,15 +722,18 @@ fn show_context_menu(hwnd: HWND) {
         match cmd.0 as usize {
             MENU_SETTINGS => {
                 // Not opened here: the menu ran inside this message, and the flyout is driven from the app's own handler.
-                let _ = PostMessageW(Some(hwnd), WM_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+                let controller = HWND(CONTROLLER.load(Ordering::Relaxed) as *mut c_void);
+                let _ = PostMessageW(Some(controller), WM_OPEN_SETTINGS, WPARAM(hwnd.0 as usize), LPARAM(0));
             }
-            MENU_EXIT => PostQuitMessage(0),
+            MENU_EXIT => quit_now(),
             _ => {}
         }
     }
 }
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+/// The hidden controller window; closing it ends the app (the visible widget windows can come and go).
+static CONTROLLER: AtomicIsize = AtomicIsize::new(0);
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -626,8 +743,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             show_context_menu(hwnd);
             return LRESULT(0);
         }
+        // Asked to close (for example by the installer, before it replaces the app): that means the whole app.
+        WM_CLOSE => quit_now(),
         WM_DESTROY => {
-            PostQuitMessage(0);
+            if hwnd.0 as isize == CONTROLLER.load(Ordering::Relaxed) {
+                quit_now();
+            }
             return LRESULT(0);
         }
         _ => {}
@@ -635,20 +756,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     let handled = APP.with(|cell| {
         let Ok(mut guard) = cell.try_borrow_mut() else { return false };
         let Some(app) = guard.as_mut() else { return false };
+        // Which widget window a mouse message is for (the controller has none).
+        let idx = app.wins.iter().position(|w| w.hwnd == hwnd);
         match msg {
             WM_SNAPSHOT => app.on_snapshot(),
-            WM_OPEN_SETTINGS => app.open_settings(),
+            WM_OPEN_SETTINGS => app.open_settings(Some(HWND(wp.0 as *mut c_void))),
             crate::shell::setup::WM_SETUP => super::flyout::update(&app.snap),
             WM_CONFIG => {
                 app.cfg = crate::config::get();
+                app.sync_windows();
                 app.rebuild();
-                app.place();
+                app.place_all();
                 app.render();
             }
             WM_TIMER if wp.0 == TIMER_TICK => app.on_tick(),
             WM_MOUSEMOVE => {
-                if !app.hover {
-                    app.hover = true;
+                let Some(i) = idx else { return false };
+                if !app.wins[i].hover {
+                    app.wins[i].hover = true;
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                         dwFlags: TME_LEAVE,
@@ -656,33 +781,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         dwHoverTime: 0,
                     };
                     let _ = TrackMouseEvent(&mut tme);
-                    app.render();
+                    app.render_win(i);
                 }
             }
             WM_MOUSELEAVE => {
-                app.hover = false;
-                app.pressed = false;
-                app.render();
+                let Some(i) = idx else { return false };
+                app.wins[i].hover = false;
+                app.wins[i].pressed = false;
+                app.render_win(i);
             }
             WM_LBUTTONDOWN => {
-                app.pressed = true;
-                app.render();
+                let Some(i) = idx else { return false };
+                app.wins[i].pressed = true;
+                app.render_win(i);
             }
             WM_LBUTTONUP => {
-                let was_pressed = app.pressed;
-                app.pressed = false;
-                app.render();
+                let Some(i) = idx else { return false };
+                let was_pressed = app.wins[i].pressed;
+                app.wins[i].pressed = false;
+                app.render_win(i);
                 if was_pressed {
-                    app.open_flyout(false);
+                    app.open_flyout(false, Some(hwnd));
                 }
             }
             WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
                 app.theme = Theme::current();
-                app.place();
+                app.sync_windows();
+                app.place_all();
                 app.render();
             }
             m if m == TASKBAR_CREATED.load(Ordering::Relaxed) => {
-                app.place();
+                app.sync_windows();
+                app.place_all();
                 app.render();
             }
             _ => return false,
@@ -709,23 +839,11 @@ pub fn run(cfg: Config) -> Result<()> {
         RegisterClassW(&wc);
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
 
-        let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-            class,
-            w!("TaskbarHWM"),
-            WS_POPUP,
-            0,
-            0,
-            200,
-            48,
-            None,
-            None,
-            Some(hinst.into()),
-            None,
-        )?;
+        // The hidden controller window (never shown): it owns the timer and receives the app's own messages.
+        let controller = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, class, w!("TaskbarHWM.Controller"), WS_POPUP, 0, 0, 0, 0, None, None, Some(hinst.into()), None)?;
+        CONTROLLER.store(controller.0 as isize, Ordering::Relaxed);
 
         let gfx = Gfx::new()?;
-        let surface = Surface::new(&gfx, 200, 48, 96.0)?;
         let fsize = cfg.font_size;
         let fmt = make_format(&gfx.dwrite, fsize, DWRITE_FONT_WEIGHT_NORMAL)?;
         let label_fmt = make_format(&gfx.dwrite, label_size(fsize), DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
@@ -734,8 +852,8 @@ pub fn run(cfg: Config) -> Result<()> {
         let shared = Arc::new(Mutex::new(Snapshot::default()));
         let mut app = App {
             gfx,
-            surface,
-            hwnd,
+            controller,
+            wins: Vec::new(),
             cfg,
             shared: shared.clone(),
             snap: Snapshot::default(),
@@ -749,19 +867,17 @@ pub fn run(cfg: Config) -> Result<()> {
             label_dy: 0.0,
             blocks: Vec::new(),
             width_dip: 120.0,
-            pos: (0, 0),
-            hover: false,
-            pressed: false,
             hidden_fullscreen: false,
             first_run_checked: false,
         };
+        app.sync_windows();
         app.rebuild();
-        app.place();
+        app.place_all();
         app.render();
         APP.with(|c| *c.borrow_mut() = Some(app));
 
-        SetTimer(Some(hwnd), TIMER_TICK, 1000, None);
-        spawn_sampler(hwnd, shared);
+        SetTimer(Some(controller), TIMER_TICK, 1000, None);
+        spawn_sampler(controller, shared);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {

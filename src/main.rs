@@ -112,6 +112,18 @@ fn main() {
         };
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
+    // Used by the uninstaller: take TaskbarHWM out of Claude Code's status line again, then exit.
+    if let Some(i) = args.iter().position(|a| a == "--claude") {
+        let result = match args.get(i + 1).map(|s| s.as_str()) {
+            Some("on") => shell::claude_setup::connect(),
+            Some("off") => {
+                // Nothing to undo if it was never connected (or Claude Code has some other status line).
+                if shell::claude_setup::link_state() == sensors::claude::Link::Connected { shell::claude_setup::disconnect() } else { Ok(()) }
+            }
+            _ => Err("usage: --claude on|off".to_string()),
+        };
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     // Single instance: a second launch just exits.
     use windows::core::w;
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};

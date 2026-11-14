@@ -72,6 +72,8 @@ Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait pos
 
 [UninstallRun]
 Filename: "{app}\{#AppExe}"; Parameters: "--autostart off"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveAutostart"
+; If Claude usage was connected, take TaskbarHWM out of Claude Code's status line so it isn't left pointing at a script that is gone.
+Filename: "{app}\{#AppExe}"; Parameters: "--claude off"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveClaudeStatusLine"
 
 [Code]
 var

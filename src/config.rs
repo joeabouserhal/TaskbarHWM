@@ -36,6 +36,12 @@ pub struct Config {
     pub net_layout: String,
     /// Network adapters (by name) whose traffic is counted. Empty means all of them, as a total.
     pub net_adapters: Vec<String>,
+    /// Displays whose taskbar shows the widget, by device name (`\.\DISPLAY2`). "*" means every display; empty means
+    /// just the main one.
+    pub widget_displays: Vec<String>,
+    /// How often Claude usage is read with `claude /usage`, in minutes (0 = never). Only runs while a Claude reading
+    /// is switched on.
+    pub claude_poll_minutes: u32,
     /// Set once the first-run welcome (settings page) has been shown.
     pub setup_shown: bool,
     /// Bumped when a release changes what saved settings mean, so one-time migrations run once.
@@ -70,6 +76,8 @@ impl Default for Config {
             net_unit: "bytes".to_string(),
             net_layout: "combined".to_string(),
             net_adapters: Vec::new(),
+            widget_displays: Vec::new(),
+            claude_poll_minutes: 2,
             setup_shown: false,
             schema: 0,
             pinned: s(&["cpu.usage", "cpu.temp", "gpu.usage", "gpu.temp"]),
@@ -122,6 +130,9 @@ impl Config {
         }
         if !matches!(self.disk_style.as_str(), "used_total" | "percent" | "free") {
             self.disk_style = "used_total".to_string();
+        }
+        if !matches!(self.claude_poll_minutes, 0 | 1 | 2 | 5 | 10) {
+            self.claude_poll_minutes = 2;
         }
         if !matches!(self.net_layout.as_str(), "combined" | "split") {
             self.net_layout = "combined".to_string();

@@ -75,6 +75,15 @@ pub fn draw(rt: &ID2D1RenderTarget, brush: &ID2D1SolidColorBrush, section: Secti
                 line((6.0, 13.5), (13.5, 13.5));
                 circle(18.0, 13.5, 1.1);
             }
+            // Claude: a burst of eight spokes, alternately long and short (a generic sparkle, not a brand asset).
+            Section::Claude => {
+                for k in 0..8 {
+                    let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                    let (c, s) = (a.cos(), a.sin());
+                    let outer = if k % 2 == 0 { 9.5 } else { 6.5 };
+                    line((12.0 + 2.2 * c, 12.0 + 2.2 * s), (12.0 + outer * c, 12.0 + outer * s));
+                }
+            }
             // Network traffic: an arrow up beside an arrow down.
             Section::Net => {
                 // Vertical extent 5..19, centered on 12.
