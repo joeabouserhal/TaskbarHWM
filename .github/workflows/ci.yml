@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The real build: it must ask for administrator rights (CPU temperature and power need them).
+      - name: Build release
+        run: cargo build --release
+
+      - name: Check the exe asks for administrator rights
+        shell: pwsh
+        run: |
+          $bytes = [IO.File]::ReadAllBytes("target\release\TaskbarHWM.exe")
+          $text = [Text.Encoding]::ASCII.GetString($bytes)
+          if ($text -notmatch "requireAdministrator") { throw "TaskbarHWM.exe is missing the requireAdministrator manifest" }
+          Write-Host ("exe size: {0:N0} bytes" -f $bytes.Length)
+
+      # Test builds can't be elevated on a runner, so they use the as-invoker override (see README, Dev flags).
+      - name: Unit tests
+        env:
+          TASKBARHWM_ASINVOKER: "1"
+          CARGO_TARGET_DIR: target/ci
+        run: cargo test --release
+
+      - name: Build test exe
+        env:
+          TASKBARHWM_ASINVOKER: "1"
+          CARGO_TARGET_DIR: target/ci
+        run: cargo build --release
+
+      - name: Runtime checks
+        shell: pwsh
+        run: ./scripts/ci-smoke.ps1 -Exe target/ci/release/TaskbarHWM.exe
